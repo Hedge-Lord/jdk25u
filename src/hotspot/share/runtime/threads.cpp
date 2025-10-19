@@ -869,6 +869,9 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   if (UsePerfData)         PerfDataManager::create_misc_perfdata();
   if (CheckJNICalls)                  JniPeriodicChecker::engage();
 
+  // Profiles-only replay loader (stub): log intent at startup
+  // MDO replay logging moved to JNI_CreateJavaVM_inner.
+
   call_postVMInitHook(THREAD);
   // The Java side of PostVMInitHook.run must deal with all
   // exceptions and provide means of diagnosis.

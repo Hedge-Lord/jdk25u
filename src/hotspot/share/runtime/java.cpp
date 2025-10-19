@@ -84,6 +84,8 @@
 #include "utilities/globalDefinitions.hpp"
 #include "utilities/macros.hpp"
 #include "utilities/vmError.hpp"
+#include "nmt/memTag.hpp"
+#include "services/mdoReplayDump.hpp"
 #ifdef COMPILER1
 #include "c1/c1_Compiler.hpp"
 #include "c1/c1_Runtime1.hpp"
@@ -102,6 +104,13 @@
 #endif
 
 GrowableArray<Method*>* collected_profiled_methods;
+static GrowableArray<Method*>* collected_all_methods;
+
+static void collect_all_methods(Method* m) {
+  if (m != nullptr && m->method_data() != nullptr) {
+    collected_all_methods->push(m);
+  }
+}
 
 static int compare_methods(Method** a, Method** b) {
   // compiled_invocation_count() returns int64_t, forcing the entire expression
@@ -294,6 +303,29 @@ void print_statistics() {
   }
 
   print_method_profiling_data();
+
+  // Profiles-only replay dumper (stub): log intent at exit
+  if (DumpMDOAtExit && MDOReplayDumpFile != nullptr) {
+    log_info(compilation)("MDO replay: will dump profiles to %s", MDOReplayDumpFile);
+    fileStream fs(MDOReplayDumpFile, "w");
+    if (fs.is_open()) {
+      // Emit a minimal header
+      fs.print_cr("# mdo-replay (MethodData only)");
+      // Run at a safepoint to avoid concurrent MDO mutations during dump
+      class VM_MDOReplayDump : public VM_Operation {
+        fileStream* _out;
+       public:
+        VM_MDOReplayDump(fileStream* out) : _out(out) {}
+        virtual VMOp_Type type() const { return VMOp_GC_HeapInspection; }
+        virtual void doit() {
+          MDOReplayDump::dump_all(_out);
+        }
+      } op(&fs);
+      VMThread::execute(&op);
+    } else {
+      log_info(compilation)("MDO replay: failed to open %s", MDOReplayDumpFile);
+    }
+  }
 
   if (TimeOopMap) {
     GenerateOopMap::print_time();
