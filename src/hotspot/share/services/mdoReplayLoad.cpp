@@ -54,6 +54,71 @@ static Method* resolve_method(InstanceKlass* ik, const char* mname_q, const char
   return ik->find_method(SymbolTable::new_symbol(mn, (int)ln), SymbolTable::new_symbol(sg, (int)ls));
 }
 
+// ---------------- Parsing helpers ----------------
+static bool parse_header(FILE* f,
+                         char* kname, size_t kcap,
+                         char* mname, size_t mncap,
+                         char* msig, size_t mscap,
+                         int& state_out, int& invc_out) {
+  char tmp[4096];
+  char* kw = read_word(f, tmp, sizeof(tmp)); if (kw == nullptr) return false; strncpy(kname, kw, kcap);
+  char* mw = read_word(f, tmp, sizeof(tmp)); if (mw == nullptr) return false; strncpy(mname, mw, mncap);
+  char* sw = read_word(f, tmp, sizeof(tmp)); if (sw == nullptr) return false; strncpy(msig, sw, mscap);
+  if (!read_int(f, state_out)) return false;
+  if (!read_int(f, invc_out)) return false;
+  return true;
+}
+
+static bool parse_orig(FILE* f) {
+  char tag[32]; if (read_word(f, tag, sizeof(tag)) == nullptr || strcmp(tag, "orig") != 0) return false;
+  int orig_len = 0; if (!read_int(f, orig_len)) return false;
+  for (int i = 0; i < orig_len; i++) { int b = 0; if (!read_int(f, b)) return false; }
+  return true;
+}
+
+static bool parse_data_words(FILE* f, GrowableArray<uintptr_t>& words) {
+  char tag[32]; if (read_word(f, tag, sizeof(tag)) == nullptr || strcmp(tag, "data") != 0) return false;
+  int nwords = 0; if (!read_int(f, nwords)) return false;
+  for (int i = 0; i < nwords; i++) { uintptr_t w = 0; if (!read_hex_word(f, w)) return false; words.push(w); }
+  return true;
+}
+
+static bool parse_oops(FILE* f,
+                       GrowableArray<int>& class_offs,
+                       GrowableArray<InstanceKlass*>& class_vals,
+                       JavaThread* THREAD) {
+  char tag[32]; if (read_word(f, tag, sizeof(tag)) == nullptr || strcmp(tag, "oops") != 0) return false;
+  int nclasses = 0; if (!read_int(f, nclasses)) return false;
+  for (int i = 0; i < nclasses; i++) {
+    int off = 0; if (!read_int(f, off)) return false;
+    char cname[4096]; if (read_word(f, cname, sizeof(cname)) == nullptr) return false;
+    InstanceKlass* ck = resolve_klass(cname, THREAD);
+    class_offs.push(off);
+    class_vals.push(ck);
+  }
+  return true;
+}
+
+static bool parse_methods(FILE* f,
+                          GrowableArray<int>& method_offs,
+                          GrowableArray<Method*>& method_vals,
+                          JavaThread* THREAD) {
+  char tag[32]; if (read_word(f, tag, sizeof(tag)) == nullptr || strcmp(tag, "methods") != 0) return false;
+  int nmethods = 0; if (!read_int(f, nmethods)) return false;
+  for (int i = 0; i < nmethods; i++) {
+    int off = 0; if (!read_int(f, off)) return false;
+    char mkname[4096], mmname[4096], mmsig[4096];
+    if (read_word(f, mkname, sizeof(mkname)) == nullptr) return false;
+    if (read_word(f, mmname, sizeof(mmname)) == nullptr) return false;
+    if (read_word(f, mmsig, sizeof(mmsig)) == nullptr) return false;
+    InstanceKlass* mik = resolve_klass(mkname, THREAD);
+    Method* mm = (mik == nullptr) ? nullptr : resolve_method(mik, mmname, mmsig);
+    method_offs.push(off);
+    method_vals.push(mm);
+  }
+  return true;
+}
+
 void MDOReplayLoad::load(JavaThread* THREAD) {
   if (!LoadMDOAtStartup || MDOReplayLoadFile == nullptr) return;
   FILE* f = os::fopen(MDOReplayLoadFile, "r");
@@ -75,47 +140,17 @@ void MDOReplayLoad::load(JavaThread* THREAD) {
       continue;
     }
     records_read++;
-    char* kname = read_word(f, word, sizeof(word)); if (kname == nullptr) break;
-    char mname[4096]; if (read_word(f, mname, sizeof(mname)) == nullptr) break;
-    char msig[4096]; if (read_word(f, msig, sizeof(msig)) == nullptr) break;
-    int state = 0, invc = 0; if (!read_int(f, state) || !read_int(f, invc)) break;
-    // expect 'orig'
-    char tag[32]; if (read_word(f, tag, sizeof(tag)) == nullptr || strcmp(tag, "orig") != 0) break;
-    int orig_len = 0; if (!read_int(f, orig_len)) break;
-    for (int i = 0; i < orig_len; i++) { int b = 0; if (!read_int(f, b)) break; /*ignored on load*/ }
-    // data
-    if (read_word(f, tag, sizeof(tag)) == nullptr || strcmp(tag, "data") != 0) break;
-    int nwords = 0; if (!read_int(f, nwords)) break;
-    GrowableArray<uintptr_t> words(nwords);
-    for (int i = 0; i < nwords; i++) { uintptr_t w = 0; if (!read_hex_word(f, w)) { nwords = i; break; } words.push(w); }
-    // oops
-    if (read_word(f, tag, sizeof(tag)) == nullptr || strcmp(tag, "oops") != 0) break;
-    int nclasses = 0; if (!read_int(f, nclasses)) break;
-    GrowableArray<int> class_offs(nclasses);
-    GrowableArray<InstanceKlass*> class_vals(nclasses);
-    for (int i = 0; i < nclasses; i++) {
-      int off = 0; if (!read_int(f, off)) break;
-      char cname[4096]; if (read_word(f, cname, sizeof(cname)) == nullptr) break;
-      InstanceKlass* ck = resolve_klass(cname, THREAD);
-      class_offs.push(off);
-      class_vals.push(ck); // may be null; will be patched as null
-    }
-    // methods
-    if (read_word(f, tag, sizeof(tag)) == nullptr || strcmp(tag, "methods") != 0) break;
-    int nmethods = 0; if (!read_int(f, nmethods)) break;
-    GrowableArray<int> method_offs(nmethods);
-    GrowableArray<Method*> method_vals(nmethods);
-    for (int i = 0; i < nmethods; i++) {
-      int off = 0; if (!read_int(f, off)) break;
-      char mkname[4096], mmname[4096], mmsig[4096];
-      if (read_word(f, mkname, sizeof(mkname)) == nullptr) break;
-      if (read_word(f, mmname, sizeof(mmname)) == nullptr) break;
-      if (read_word(f, mmsig, sizeof(mmsig)) == nullptr) break;
-      InstanceKlass* mik = resolve_klass(mkname, THREAD);
-      Method* mm = (mik == nullptr) ? nullptr : resolve_method(mik, mmname, mmsig);
-      method_offs.push(off);
-      method_vals.push(mm);
-    }
+    char kname[4096], mname[4096], msig[4096]; int state = 0, invc = 0;
+    if (!parse_header(f, kname, sizeof(kname), mname, sizeof(mname), msig, sizeof(msig), state, invc)) break;
+    if (!parse_orig(f)) break;
+    GrowableArray<uintptr_t> words(16);
+    if (!parse_data_words(f, words)) break;
+    GrowableArray<int> class_offs(8);
+    GrowableArray<InstanceKlass*> class_vals(8);
+    if (!parse_oops(f, class_offs, class_vals, THREAD)) break;
+    GrowableArray<int> method_offs(4);
+    GrowableArray<Method*> method_vals(4);
+    if (!parse_methods(f, method_offs, method_vals, THREAD)) break;
 
     // Resolve target Method and ensure MDO exists
     InstanceKlass* holder = resolve_klass(kname, THREAD);
@@ -138,15 +173,15 @@ void MDOReplayLoad::load(JavaThread* THREAD) {
 
     // Size check: must match
     int total_cells = (mdo->data_size() + mdo->extra_data_size()) / (int)sizeof(intptr_t);
-    if (nwords != total_cells) { size_mismatch++; continue; }
+    if ((int)words.length() != total_cells) { size_mismatch++; continue; }
 
   // Copy only up to args_data_limit: primary data + extra_data + params header region
   // We will zero the trap/arg-info extra slice immediately after.
   {
 #ifdef _LP64
-    Copy::conjoint_jlongs_atomic((jlong*)words.adr_at(0), (jlong*)mdo->data_base(), nwords);
+    Copy::conjoint_jlongs_atomic((jlong*)words.adr_at(0), (jlong*)mdo->data_base(), words.length());
 #else
-    Copy::conjoint_jints_atomic((jint*)words.adr_at(0), (jint*)mdo->data_base(), nwords);
+    Copy::conjoint_jints_atomic((jint*)words.adr_at(0), (jint*)mdo->data_base(), words.length());
 #endif
   }
 
@@ -335,7 +370,7 @@ void MDOReplayLoad::load(JavaThread* THREAD) {
     records_installed++;
     if (log_is_enabled(Debug, compilation)) {
       log_debug(compilation)("MDO replay: installed %s %s %s (cells=%d, oops=%d, methods=%d)",
-                             kname, mname, msig, nwords, patched_classes, patched_methods);
+                             kname, mname, msig, (int)words.length(), patched_classes, patched_methods);
     }
   }
   fclose(f);
