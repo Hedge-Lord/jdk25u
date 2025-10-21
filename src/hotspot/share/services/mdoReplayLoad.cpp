@@ -119,6 +119,221 @@ static bool parse_methods(FILE* f,
   return true;
 }
 
+// Load a single MethodData record; return false only on parse failure (break), true otherwise
+static bool load_one_mdo(FILE* f,
+                         JavaThread* THREAD,
+                         int& size_mismatch,
+                         int& records_installed) {
+  char kname[4096], mname[4096], msig[4096]; int state = 0, invc = 0;
+  if (!parse_header(f, kname, sizeof(kname), mname, sizeof(mname), msig, sizeof(msig), state, invc)) return false;
+  if (!parse_orig(f)) return false;
+  GrowableArray<uintptr_t> words(16);
+  if (!parse_data_words(f, words)) return false;
+  GrowableArray<int> class_offs(8);
+  GrowableArray<InstanceKlass*> class_vals(8);
+  if (!parse_oops(f, class_offs, class_vals, THREAD)) return false;
+  GrowableArray<int> method_offs(4);
+  GrowableArray<Method*> method_vals(4);
+  if (!parse_methods(f, method_offs, method_vals, THREAD)) return false;
+
+  // Resolve target Method and ensure MDO exists
+  InstanceKlass* holder = resolve_klass(kname, THREAD);
+  if (holder == nullptr) return true;
+  Method* target = resolve_method(holder, mname, msig);
+  if (target == nullptr) return true;
+  // Ensure the holder is linked before creating or touching profiling data
+  holder->link_class(THREAD);
+  if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; return true; }
+  if (target->method_data() == nullptr) {
+    methodHandle mh(THREAD, target);
+    target->build_profiling_method_data(mh, CHECK_(true));
+    if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; return true; }
+  }
+  MethodData* mdo = target->method_data();
+  if (mdo == nullptr) return true;
+
+  // Reset escape analysis info to avoid inconsistent state
+  mdo->clear_escape_info();
+
+  // Size check: must match
+  int total_cells = (mdo->data_size() + mdo->extra_data_size()) / (int)sizeof(intptr_t);
+  if ((int)words.length() != total_cells) { size_mismatch++; return true; }
+
+  // Copy full cells (data + extra)
+  {
+#ifdef _LP64
+    Copy::conjoint_jlongs_atomic((jlong*)words.adr_at(0), (jlong*)mdo->data_base(), words.length());
+#else
+    Copy::conjoint_jints_atomic((jint*)words.adr_at(0), (jint*)mdo->data_base(), words.length());
+#endif
+  }
+
+  // Zero-out the extra-data trap/arg-info slice and synthesize minimal ArgInfoData
+  {
+    DataLayout* extra_base = mdo->extra_data_base();
+    DataLayout* args_limit = mdo->args_data_limit();
+    if (args_limit > extra_base) {
+      size_t bytes = ((address)args_limit) - ((address)extra_base);
+      memset((void*)extra_base, 0, bytes);
+    }
+    int nparams = target->size_of_parameters();
+    if (nparams > 0) {
+      const int cell_size = (int)sizeof(intptr_t);
+      const int header_bytes = DataLayout::header_size_in_bytes();
+      const size_t total_bytes = (size_t)header_bytes + (size_t)(nparams + 1) * (size_t)cell_size;
+      if (((address)args_limit) >= ((address)extra_base) + total_bytes) {
+        address arg_info_start = ((address)args_limit) - total_bytes;
+        memset((void*)arg_info_start, 0, total_bytes);
+        DataLayout* aid = (DataLayout*)arg_info_start;
+        aid->set_header(0);
+        *(u1*)((address)aid + in_bytes(DataLayout::tag_offset())) = (u1)DataLayout::arg_info_data_tag;
+        aid->set_cell_at(0, (intptr_t)nparams);
+      }
+    }
+  }
+
+  // Sanitize: clear all type-entry Klass* pointers to avoid stale addresses; preserve status bits
+  {
+    for (ProfileData* pd = mdo->first_data(); mdo->is_valid(pd); pd = mdo->next_data(pd)) {
+      if (pd->is_VirtualCallData() || pd->is_ReceiverTypeData()) {
+        ReceiverTypeData* rtd = pd->as_ReceiverTypeData();
+        for (uint row = 0; row < rtd->row_limit(); row++) {
+          int off_b = in_bytes(ReceiverTypeData::receiver_offset(row));
+          intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
+          *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
+        }
+      }
+      if (pd->is_CallTypeData()) {
+        CallTypeData* ctd = (CallTypeData*)pd;
+        if (ctd->has_arguments()) {
+          for (int i = 0; i < ctd->number_of_arguments(); i++) {
+            int off_b = in_bytes(ctd->argument_type_offset(i));
+            intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
+            *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
+          }
+        }
+        if (ctd->has_return()) {
+          int off_b = in_bytes(ctd->return_type_offset());
+          intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
+          *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
+        }
+      }
+      if (pd->is_VirtualCallTypeData()) {
+        VirtualCallTypeData* vctd = pd->as_VirtualCallTypeData();
+        if (vctd->has_arguments()) {
+          for (int i = 0; i < vctd->number_of_arguments(); i++) {
+            int off_b = in_bytes(vctd->argument_type_offset(i));
+            intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
+            *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
+          }
+        }
+        if (vctd->has_return()) {
+          int off_b = in_bytes(vctd->return_type_offset());
+          intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
+          *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
+        }
+      }
+    }
+    ParametersTypeData* p = mdo->parameters_type_data();
+    if (p != nullptr) {
+      address p_dp = p->dp();
+      for (int i = 0; i < p->number_of_parameters(); i++) {
+        int off_b = in_bytes(ParametersTypeData::type_offset(i));
+        intptr_t* cell = (intptr_t*)(p_dp + off_b);
+        *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
+      }
+    }
+  }
+
+  // Patch method pointers in extra data (if any): may be nullptr
+  int patched_methods = 0;
+  for (int i = 0; i < method_offs.length(); i++) {
+    int off = method_offs.at(i);
+    intptr_t* slot = ((intptr_t*)mdo->data_base()) + off;
+    Method* mv = method_vals.at(i);
+    *(Method**)slot = mv;
+    patched_methods++;
+  }
+
+  // Final scrub: ensure all Klass* in type entries are live; null out otherwise
+  {
+    for (ProfileData* pd = mdo->first_data(); mdo->is_valid(pd); pd = mdo->next_data(pd)) {
+      if (pd->is_VirtualCallData() || pd->is_ReceiverTypeData()) {
+        ReceiverTypeData* rtd = pd->as_ReceiverTypeData();
+        for (uint row = 0; row < rtd->row_limit(); row++) {
+          int off_b = in_bytes(ReceiverTypeData::receiver_offset(row));
+          intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
+          Klass* k = (Klass*)TypeEntries::klass_part(*cell);
+          if (k != nullptr && !Metaspace::contains((address)k)) {
+            *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
+          }
+        }
+      }
+      if (pd->is_CallTypeData()) {
+        CallTypeData* ctd = (CallTypeData*)pd;
+        if (ctd->has_arguments()) {
+          for (int i = 0; i < ctd->number_of_arguments(); i++) {
+            int off_b = in_bytes(ctd->argument_type_offset(i));
+            intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
+            Klass* k = (Klass*)TypeEntries::klass_part(*cell);
+            if (k != nullptr && !Metaspace::contains((address)k)) {
+              *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
+            }
+          }
+        }
+        if (ctd->has_return()) {
+          int off_b = in_bytes(ctd->return_type_offset());
+          intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
+          Klass* k = (Klass*)TypeEntries::klass_part(*cell);
+          if (k != nullptr && !Metaspace::contains((address)k)) {
+            *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
+          }
+        }
+      }
+      if (pd->is_VirtualCallTypeData()) {
+        VirtualCallTypeData* vctd = pd->as_VirtualCallTypeData();
+        if (vctd->has_arguments()) {
+          for (int i = 0; i < vctd->number_of_arguments(); i++) {
+            int off_b = in_bytes(vctd->argument_type_offset(i));
+            intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
+            Klass* k = (Klass*)TypeEntries::klass_part(*cell);
+            if (k != nullptr && !Metaspace::contains((address)k)) {
+              *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
+            }
+          }
+        }
+        if (vctd->has_return()) {
+          int off_b = in_bytes(vctd->return_type_offset());
+          intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
+          Klass* k = (Klass*)TypeEntries::klass_part(*cell);
+          if (k != nullptr && !Metaspace::contains((address)k)) {
+            *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
+          }
+        }
+      }
+    }
+    ParametersTypeData* p2 = mdo->parameters_type_data();
+    if (p2 != nullptr) {
+      address p_dp = p2->dp();
+      for (int i = 0; i < p2->number_of_parameters(); i++) {
+        int off_b = in_bytes(ParametersTypeData::type_offset(i));
+        intptr_t* cell = (intptr_t*)(p_dp + off_b);
+        Klass* k = (Klass*)TypeEntries::klass_part(*cell);
+        if (k != nullptr && !Metaspace::contains((address)k)) {
+          *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
+        }
+      }
+    }
+  }
+
+  records_installed++;
+  if (log_is_enabled(Debug, compilation)) {
+    log_debug(compilation)("MDO replay: installed %s %s %s (cells=%d, oops=%d, methods=%d)",
+                           kname, mname, msig, (int)words.length(), 0, patched_methods);
+  }
+  return true;
+}
+
 void MDOReplayLoad::load(JavaThread* THREAD) {
   if (!LoadMDOAtStartup || MDOReplayLoadFile == nullptr) return;
   FILE* f = os::fopen(MDOReplayLoadFile, "r");
@@ -140,238 +355,7 @@ void MDOReplayLoad::load(JavaThread* THREAD) {
       continue;
     }
     records_read++;
-    char kname[4096], mname[4096], msig[4096]; int state = 0, invc = 0;
-    if (!parse_header(f, kname, sizeof(kname), mname, sizeof(mname), msig, sizeof(msig), state, invc)) break;
-    if (!parse_orig(f)) break;
-    GrowableArray<uintptr_t> words(16);
-    if (!parse_data_words(f, words)) break;
-    GrowableArray<int> class_offs(8);
-    GrowableArray<InstanceKlass*> class_vals(8);
-    if (!parse_oops(f, class_offs, class_vals, THREAD)) break;
-    GrowableArray<int> method_offs(4);
-    GrowableArray<Method*> method_vals(4);
-    if (!parse_methods(f, method_offs, method_vals, THREAD)) break;
-
-    // Resolve target Method and ensure MDO exists
-    InstanceKlass* holder = resolve_klass(kname, THREAD);
-    if (holder == nullptr) continue;
-    Method* target = resolve_method(holder, mname, msig);
-    if (target == nullptr) continue;
-  // Ensure the holder is linked before creating or touching profiling data
-  holder->link_class(THREAD);
-  if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; continue; }
-    if (target->method_data() == nullptr) {
-      methodHandle mh(THREAD, target);
-      target->build_profiling_method_data(mh, CHECK);
-      if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; continue; }
-    }
-    MethodData* mdo = target->method_data();
-    if (mdo == nullptr) continue;
-
-    // Reset escape analysis info to avoid inconsistent state
-    mdo->clear_escape_info();
-
-    // Size check: must match
-    int total_cells = (mdo->data_size() + mdo->extra_data_size()) / (int)sizeof(intptr_t);
-    if ((int)words.length() != total_cells) { size_mismatch++; continue; }
-
-  // Copy only up to args_data_limit: primary data + extra_data + params header region
-  // We will zero the trap/arg-info extra slice immediately after.
-  {
-#ifdef _LP64
-    Copy::conjoint_jlongs_atomic((jlong*)words.adr_at(0), (jlong*)mdo->data_base(), words.length());
-#else
-    Copy::conjoint_jints_atomic((jint*)words.adr_at(0), (jint*)mdo->data_base(), words.length());
-#endif
-  }
-
-  // Zero-out the extra-data trap/arg-info slice to avoid inconsistent tags
-  {
-    DataLayout* extra_base = mdo->extra_data_base();
-    DataLayout* args_limit = mdo->args_data_limit();
-    if (args_limit > extra_base) {
-      size_t bytes = ((address)args_limit) - ((address)extra_base);
-      memset((void*)extra_base, 0, bytes);
-    }
-
-    // Synthesize a minimal ArgInfoData at the end with all zeros so CI can update
-    // Find the start of ArgInfoData record: it is the last entry before args_data_limit
-    // We place a header right before args_data_limit with tag=arg_info_data_tag and array_len=method parameter count
-    int nparams = target->size_of_parameters();
-    if (nparams > 0) {
-      // ArgInfoData occupies header + (len cell + nparams entries) cells
-      const int cell_size = (int)sizeof(intptr_t);
-      const int header_bytes = DataLayout::header_size_in_bytes();
-      const size_t total_bytes = (size_t)header_bytes + (size_t)(nparams + 1) * (size_t)cell_size;
-      if (((address)args_limit) >= ((address)extra_base) + total_bytes) {
-        address arg_info_start = ((address)args_limit) - total_bytes;
-        // Zero region and place header
-        memset((void*)arg_info_start, 0, total_bytes);
-        DataLayout* aid = (DataLayout*)arg_info_start;
-        aid->set_header(0);
-        *(u1*)((address)aid + in_bytes(DataLayout::tag_offset())) = (u1)DataLayout::arg_info_data_tag;
-        // Set array length in first cell
-        aid->set_cell_at(0, (intptr_t)nparams);
-      }
-    }
-  }
-
-    // Sanitize: clear all type-entry Klass* pointers to avoid stale addresses;
-    // we'll re-patch known ones below. Preserve status bits.
-    {
-      for (ProfileData* pd = mdo->first_data(); mdo->is_valid(pd); pd = mdo->next_data(pd)) {
-        if (pd->is_VirtualCallData() || pd->is_ReceiverTypeData()) {
-          ReceiverTypeData* rtd = pd->as_ReceiverTypeData();
-          for (uint row = 0; row < rtd->row_limit(); row++) {
-            int off_b = in_bytes(ReceiverTypeData::receiver_offset(row));
-            intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
-            *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
-          }
-        }
-        if (pd->is_CallTypeData()) {
-          CallTypeData* ctd = (CallTypeData*)pd;
-          if (ctd->has_arguments()) {
-            for (int i = 0; i < ctd->number_of_arguments(); i++) {
-              int off_b = in_bytes(ctd->argument_type_offset(i));
-              intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
-              *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
-            }
-          }
-          if (ctd->has_return()) {
-            int off_b = in_bytes(ctd->return_type_offset());
-            intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
-            *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
-          }
-        }
-        if (pd->is_VirtualCallTypeData()) {
-          VirtualCallTypeData* vctd = pd->as_VirtualCallTypeData();
-          if (vctd->has_arguments()) {
-            for (int i = 0; i < vctd->number_of_arguments(); i++) {
-              int off_b = in_bytes(vctd->argument_type_offset(i));
-              intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
-              *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
-            }
-          }
-          if (vctd->has_return()) {
-            int off_b = in_bytes(vctd->return_type_offset());
-            intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
-            *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
-          }
-        }
-      }
-      ParametersTypeData* p = mdo->parameters_type_data();
-      if (p != nullptr) {
-        address p_dp = p->dp();
-        for (int i = 0; i < p->number_of_parameters(); i++) {
-          int off_b = in_bytes(ParametersTypeData::type_offset(i));
-          intptr_t* cell = (intptr_t*)(p_dp + off_b);
-          *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
-        }
-      }
-    }
-
-    // Patch class pointers (TypeEntries): null on failure, preserving status bits
-    int patched_classes = 0;
-    // Safety-first: skip repatching TypeEntries Klass* to avoid stale metadata crashes.
-    // Profiles still contribute counters without receiver types.
-
-    // Patch method pointers in extra data: null on failure
-    int patched_methods = 0;
-    for (int i = 0; i < method_offs.length(); i++) {
-      int off = method_offs.at(i);
-      intptr_t* slot = ((intptr_t*)mdo->data_base()) + off;
-      Method* mv = method_vals.at(i);
-      *(Method**)slot = mv; // may be nullptr
-      patched_methods++;
-    }
-
-    // Final scrub: ensure all Klass* in type entries are live; null out otherwise
-    {
-      for (ProfileData* pd = mdo->first_data(); mdo->is_valid(pd); pd = mdo->next_data(pd)) {
-        if (pd->is_VirtualCallData() || pd->is_ReceiverTypeData()) {
-          ReceiverTypeData* rtd = pd->as_ReceiverTypeData();
-          for (uint row = 0; row < rtd->row_limit(); row++) {
-            int off_b = in_bytes(ReceiverTypeData::receiver_offset(row));
-            intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
-            Klass* k = (Klass*)TypeEntries::klass_part(*cell);
-            if (k != nullptr) {
-              if (!Metaspace::contains((address)k)) {
-                *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
-              }
-            }
-          }
-        }
-        if (pd->is_CallTypeData()) {
-          CallTypeData* ctd = (CallTypeData*)pd;
-          if (ctd->has_arguments()) {
-            for (int i = 0; i < ctd->number_of_arguments(); i++) {
-              int off_b = in_bytes(ctd->argument_type_offset(i));
-              intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
-              Klass* k = (Klass*)TypeEntries::klass_part(*cell);
-              if (k != nullptr) {
-                if (!Metaspace::contains((address)k)) {
-                  *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
-                }
-              }
-            }
-          }
-          if (ctd->has_return()) {
-            int off_b = in_bytes(ctd->return_type_offset());
-            intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
-            Klass* k = (Klass*)TypeEntries::klass_part(*cell);
-            if (k != nullptr) {
-              if (!Metaspace::contains((address)k)) {
-                *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
-              }
-            }
-          }
-        }
-        if (pd->is_VirtualCallTypeData()) {
-          VirtualCallTypeData* vctd = pd->as_VirtualCallTypeData();
-          if (vctd->has_arguments()) {
-            for (int i = 0; i < vctd->number_of_arguments(); i++) {
-              int off_b = in_bytes(vctd->argument_type_offset(i));
-              intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
-              Klass* k = (Klass*)TypeEntries::klass_part(*cell);
-              if (k != nullptr) {
-                if (!Metaspace::contains((address)k)) {
-                  *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
-                }
-              }
-            }
-          }
-          if (vctd->has_return()) {
-            int off_b = in_bytes(vctd->return_type_offset());
-            intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
-            Klass* k = (Klass*)TypeEntries::klass_part(*cell);
-            if (k != nullptr) {
-              if (!Metaspace::contains((address)k)) {
-                *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
-              }
-            }
-          }
-        }
-      }
-      ParametersTypeData* p = mdo->parameters_type_data();
-      if (p != nullptr) {
-        address p_dp = p->dp();
-        for (int i = 0; i < p->number_of_parameters(); i++) {
-          int off_b = in_bytes(ParametersTypeData::type_offset(i));
-          intptr_t* cell = (intptr_t*)(p_dp + off_b);
-          Klass* k = (Klass*)TypeEntries::klass_part(*cell);
-          if (k != nullptr) {
-            if (!Metaspace::contains((address)k)) {
-              *cell = TypeEntries::with_status((Klass*)nullptr, *cell);
-            }
-          }
-        }
-      }
-    }
-    records_installed++;
-    if (log_is_enabled(Debug, compilation)) {
-      log_debug(compilation)("MDO replay: installed %s %s %s (cells=%d, oops=%d, methods=%d)",
-                             kname, mname, msig, (int)words.length(), patched_classes, patched_methods);
-    }
+    if (!load_one_mdo(f, THREAD, size_mismatch, records_installed)) break;
   }
   fclose(f);
   log_info(compilation)("MDO replay: loaded %d records (%d installed, %d size mismatch)",

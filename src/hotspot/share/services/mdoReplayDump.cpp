@@ -49,6 +49,34 @@ static void dump_cells(fileStream* out, MethodData* mdo) {
   }
 }
 
+// Small helpers to avoid duplication when collecting Klass* cells
+static void add_klass_cell_if_in_bounds(MethodData* mdo,
+                                        address base_dp,
+                                        int off_bytes,
+                                        Klass* k,
+                                        int elements,
+                                        GrowableArray<int>& class_offsets,
+                                        GrowableArray<Klass*>& class_klasses) {
+  if (k == nullptr) return;
+  int di_bytes = mdo->dp_to_di(base_dp + off_bytes);
+  int off_cells = di_bytes / (int)sizeof(intptr_t);
+  if (0 <= off_cells && off_cells < elements) {
+    class_offsets.push(off_cells);
+    class_klasses.push(k);
+  }
+}
+
+static void add_typeentry_if_present(MethodData* mdo,
+                                     address base_dp,
+                                     int off_bytes,
+                                     int elements,
+                                     GrowableArray<int>& class_offsets,
+                                     GrowableArray<Klass*>& class_klasses) {
+  intptr_t val = *(intptr_t*)(base_dp + off_bytes);
+  Klass* k = TypeEntries::valid_klass(val);
+  add_klass_cell_if_in_bounds(mdo, base_dp, off_bytes, k, elements, class_offsets, class_klasses);
+}
+
  
 
 static void collect_oops_and_methods(MethodData* mdo,
@@ -56,86 +84,40 @@ static void collect_oops_and_methods(MethodData* mdo,
                                      GrowableArray<Klass*>& class_klasses,
                                      GrowableArray<int>& method_offsets,
                                      GrowableArray<Method*>& method_targets) {
+  const int elements = (mdo->data_size() + mdo->extra_data_size()) / (int)sizeof(intptr_t);
   for (ProfileData* pd = mdo->first_data(); mdo->is_valid(pd); pd = mdo->next_data(pd)) {
     if (pd->is_VirtualCallData()) {
       VirtualCallData* vcd = pd->as_VirtualCallData();
       for (uint row = 0; row < vcd->row_limit(); row++) {
         Klass* k = vcd->receiver(row);
-        if (k != nullptr) {
-          int di_bytes = mdo->dp_to_di(pd->dp() + in_bytes(VirtualCallData::receiver_offset(row)));
-          int off_cells = di_bytes / (int)sizeof(intptr_t);
-          int elements = (mdo->data_size() + mdo->extra_data_size()) / (int)sizeof(intptr_t);
-          if (0 <= off_cells && off_cells < elements) {
-            class_offsets.push(off_cells);
-            class_klasses.push(k);
-          }
-        }
+        add_klass_cell_if_in_bounds(mdo, pd->dp(), in_bytes(VirtualCallData::receiver_offset(row)), k,
+                                    elements, class_offsets, class_klasses);
       }
     }
     if (pd->is_CallTypeData()) {
       CallTypeData* ctd = (CallTypeData*)pd;
       if (ctd->has_arguments()) {
         for (int i = 0; i < ctd->number_of_arguments(); i++) {
-          int off_bytes = in_bytes(ctd->argument_type_offset(i));
-          intptr_t val = *(intptr_t*)(pd->dp() + off_bytes);
-          Klass* k = TypeEntries::valid_klass(val);
-          if (k != nullptr) {
-            int di_bytes = mdo->dp_to_di(pd->dp() + off_bytes);
-            int off_cells = di_bytes / (int)sizeof(intptr_t);
-            int elements = (mdo->data_size() + mdo->extra_data_size()) / (int)sizeof(intptr_t);
-            if (0 <= off_cells && off_cells < elements) {
-              class_offsets.push(off_cells);
-              class_klasses.push(k);
-            }
-          }
+          add_typeentry_if_present(mdo, pd->dp(), in_bytes(ctd->argument_type_offset(i)),
+                                   elements, class_offsets, class_klasses);
         }
       }
       if (ctd->has_return()) {
-        int off_bytes = in_bytes(ctd->return_type_offset());
-        intptr_t val = *(intptr_t*)(pd->dp() + off_bytes);
-        Klass* k = TypeEntries::valid_klass(val);
-        if (k != nullptr) {
-          int di_bytes = mdo->dp_to_di(pd->dp() + off_bytes);
-          int off_cells = di_bytes / (int)sizeof(intptr_t);
-          int elements = (mdo->data_size() + mdo->extra_data_size()) / (int)sizeof(intptr_t);
-          if (0 <= off_cells && off_cells < elements) {
-            class_offsets.push(off_cells);
-            class_klasses.push(k);
-          }
-        }
+        add_typeentry_if_present(mdo, pd->dp(), in_bytes(ctd->return_type_offset()),
+                                 elements, class_offsets, class_klasses);
       }
     }
     if (pd->is_VirtualCallTypeData()) {
       VirtualCallTypeData* vctd = pd->as_VirtualCallTypeData();
       if (vctd->has_arguments()) {
         for (int i = 0; i < vctd->number_of_arguments(); i++) {
-          int off_bytes = in_bytes(vctd->argument_type_offset(i));
-          intptr_t val = *(intptr_t*)(pd->dp() + off_bytes);
-          Klass* k = TypeEntries::valid_klass(val);
-          if (k != nullptr) {
-            int di_bytes = mdo->dp_to_di(pd->dp() + off_bytes);
-            int off_cells = di_bytes / (int)sizeof(intptr_t);
-            int elements = (mdo->data_size() + mdo->extra_data_size()) / (int)sizeof(intptr_t);
-            if (0 <= off_cells && off_cells < elements) {
-              class_offsets.push(off_cells);
-              class_klasses.push(k);
-            }
-          }
+          add_typeentry_if_present(mdo, pd->dp(), in_bytes(vctd->argument_type_offset(i)),
+                                   elements, class_offsets, class_klasses);
         }
       }
       if (vctd->has_return()) {
-        int off_bytes = in_bytes(vctd->return_type_offset());
-        intptr_t val = *(intptr_t*)(pd->dp() + off_bytes);
-        Klass* k = TypeEntries::valid_klass(val);
-        if (k != nullptr) {
-          int di_bytes = mdo->dp_to_di(pd->dp() + off_bytes);
-          int off_cells = di_bytes / (int)sizeof(intptr_t);
-          int elements = (mdo->data_size() + mdo->extra_data_size()) / (int)sizeof(intptr_t);
-          if (0 <= off_cells && off_cells < elements) {
-            class_offsets.push(off_cells);
-            class_klasses.push(k);
-          }
-        }
+        add_typeentry_if_present(mdo, pd->dp(), in_bytes(vctd->return_type_offset()),
+                                 elements, class_offsets, class_klasses);
       }
     }
   }
@@ -143,18 +125,8 @@ static void collect_oops_and_methods(MethodData* mdo,
     ParametersTypeData* p = mdo->parameters_type_data();
     address p_dp = p->dp();
     for (int i = 0; i < p->number_of_parameters(); i++) {
-      int off_bytes = in_bytes(ParametersTypeData::type_offset(i));
-      intptr_t val = *(intptr_t*)(p_dp + off_bytes);
-      Klass* k = TypeEntries::valid_klass(val);
-      if (k != nullptr) {
-        int di_bytes = mdo->dp_to_di(p_dp + off_bytes);
-        int off_cells = di_bytes / (int)sizeof(intptr_t);
-        int elements = (mdo->data_size() + mdo->extra_data_size()) / (int)sizeof(intptr_t);
-        if (0 <= off_cells && off_cells < elements) {
-          class_offsets.push(off_cells);
-          class_klasses.push(k);
-        }
-      }
+      add_typeentry_if_present(mdo, p_dp, in_bytes(ParametersTypeData::type_offset(i)),
+                               elements, class_offsets, class_klasses);
     }
   }
 }
