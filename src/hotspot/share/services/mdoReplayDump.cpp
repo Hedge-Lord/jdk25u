@@ -24,7 +24,8 @@ static void dump_header(fileStream* out, Method* m, MethodData* mdo) {
   const int state = mdo->is_mature() ? 2 /*mature*/ : 1 /*immature*/;
   int invc = mdo->invocation_count();
   if (invc == 0 && mdo->backedge_count() > 0) invc = 1;
-  out->print("MethodData %s %s %s %d %d", kname, mname, sig, state, invc);
+  int backc = mdo->backedge_count();
+  out->print("MethodData %s %s %s %d %d %d", kname, mname, sig, state, invc, backc);
 }
 
 static void dump_orig(fileStream* out, MethodData* mdo) {

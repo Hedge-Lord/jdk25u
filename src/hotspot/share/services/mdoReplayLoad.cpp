@@ -41,9 +41,22 @@ static InstanceKlass* resolve_klass(const char* qname, TRAPS) {
   if (len >= 2 && s[0] == '"' && s[len-1] == '"') { s++; len -= 2; }
   Symbol* sym = SymbolTable::new_symbol(s, (int)len);
   // Use the Java system loader (same as ciReplay) instead of bootstrap-only
-  Handle loader(THREAD, SystemDictionary::java_system_loader());
+  oop sys_loader_oop = SystemDictionary::java_system_loader();
+  if (log_is_enabled(Debug, compilation)) {
+    log_debug(compilation)("MDO replay: resolve_klass name=%s system_loader=%p", s, (void*)sys_loader_oop);
+  }
+  Handle loader(THREAD, sys_loader_oop);
   Klass* k = SystemDictionary::resolve_or_fail(sym, loader, true, THREAD);
-  if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; return nullptr; }
+  if (HAS_PENDING_EXCEPTION) {
+    if (log_is_enabled(Debug, compilation)) {
+      log_debug(compilation)("MDO replay: resolve_klass failed for %s (exception), clearing and skipping", s);
+    }
+    CLEAR_PENDING_EXCEPTION;
+    return nullptr;
+  }
+  if (log_is_enabled(Debug, compilation)) {
+    log_debug(compilation)("MDO replay: resolve_klass %s -> %p", s, (void*)k);
+  }
   if (k != nullptr && k->is_instance_klass()) return InstanceKlass::cast(k);
   return nullptr;
 }
@@ -59,20 +72,23 @@ static bool parse_header(FILE* f,
                          char* kname, size_t kcap,
                          char* mname, size_t mncap,
                          char* msig, size_t mscap,
-                         int& state_out, int& invc_out) {
+                         int& state_out, int& invc_out, int& backc_out) {
   char tmp[4096];
   char* kw = read_word(f, tmp, sizeof(tmp)); if (kw == nullptr) return false; strncpy(kname, kw, kcap);
   char* mw = read_word(f, tmp, sizeof(tmp)); if (mw == nullptr) return false; strncpy(mname, mw, mncap);
   char* sw = read_word(f, tmp, sizeof(tmp)); if (sw == nullptr) return false; strncpy(msig, sw, mscap);
   if (!read_int(f, state_out)) return false;
   if (!read_int(f, invc_out)) return false;
+  if (!read_int(f, backc_out)) return false;
   return true;
 }
 
-static bool parse_orig(FILE* f) {
+static bool parse_orig(FILE* f, GrowableArray<unsigned char>& out_bytes) {
   char tag[32]; if (read_word(f, tag, sizeof(tag)) == nullptr || strcmp(tag, "orig") != 0) return false;
   int orig_len = 0; if (!read_int(f, orig_len)) return false;
-  for (int i = 0; i < orig_len; i++) { int b = 0; if (!read_int(f, b)) return false; }
+  for (int i = 0; i < orig_len; i++) {
+    int b = 0; if (!read_int(f, b)) return false; out_bytes.push((unsigned char)(b & 0xFF));
+  }
   return true;
 }
 
@@ -124,9 +140,10 @@ static bool load_one_mdo(FILE* f,
                          JavaThread* THREAD,
                          int& size_mismatch,
                          int& records_installed) {
-  char kname[4096], mname[4096], msig[4096]; int state = 0, invc = 0;
-  if (!parse_header(f, kname, sizeof(kname), mname, sizeof(mname), msig, sizeof(msig), state, invc)) return false;
-  if (!parse_orig(f)) return false;
+  char kname[4096], mname[4096], msig[4096]; int state = 0, invc = 0, backc = 0;
+  if (!parse_header(f, kname, sizeof(kname), mname, sizeof(mname), msig, sizeof(msig), state, invc, backc)) return false;
+  GrowableArray<unsigned char> orig_bytes(64);
+  if (!parse_orig(f, orig_bytes)) return false;
   GrowableArray<uintptr_t> words(16);
   if (!parse_data_words(f, words)) return false;
   GrowableArray<int> class_offs(8);
@@ -154,6 +171,23 @@ static bool load_one_mdo(FILE* f,
 
   // Reset escape analysis info to avoid inconsistent state
   mdo->clear_escape_info();
+
+  // Restore invocation/backedge counters into MethodData and MethodCounters
+  {
+    // Set MDO counters (InvocationCounter objects) via atomic helpers
+    mdo->invocation_counter()->set((unsigned)invc);
+    mdo->backedge_counter()->set((unsigned)backc);
+  }
+
+  // Restore CompilerCounters header bytes ("orig")
+  if (orig_bytes.length() > 0) {
+    size_t cc_offset = in_bytes(MethodData::trap_history_offset()) - in_bytes(MethodData::CompilerCounters::trap_history_offset());
+    unsigned char* dst = (unsigned char*)((address)mdo + cc_offset);
+    size_t copy_len = orig_bytes.length();
+    if (copy_len > sizeof(MethodData::CompilerCounters)) copy_len = sizeof(MethodData::CompilerCounters);
+    // Copy bytes back into the MDO's CompilerCounters
+    Copy::conjoint_jbytes((const char*)orig_bytes.adr_at(0), (char*)dst, (jlong)copy_len);
+  }
 
   // Size check: must match
   int total_cells = (mdo->data_size() + mdo->extra_data_size()) / (int)sizeof(intptr_t);
@@ -340,6 +374,9 @@ void MDOReplayLoad::load(JavaThread* THREAD) {
   if (f == nullptr) { return; }
   ResourceMark rm;
   log_info(compilation)("MDO replay: loading from %s", MDOReplayLoadFile);
+  if (log_is_enabled(Debug, compilation)) {
+    log_debug(compilation)("MDO replay: system_loader at load entry: %p", (void*)SystemDictionary::java_system_loader());
+  }
   int records_read = 0;
   int records_installed = 0;
   int size_mismatch = 0;
