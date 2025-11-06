@@ -85,7 +85,7 @@
 #include "utilities/macros.hpp"
 #include "utilities/vmError.hpp"
 #include "nmt/memTag.hpp"
-#include "services/mdoReplayDump.hpp"
+#include "services/profileCheckpoint.hpp"
 #ifdef COMPILER1
 #include "c1/c1_Compiler.hpp"
 #include "c1/c1_Runtime1.hpp"
@@ -304,13 +304,11 @@ void print_statistics() {
 
   print_method_profiling_data();
 
-  // Profiles-only replay dumper (stub): log intent at exit
+  // Binary MDO replay dumper: write MDOX file at exit
   if (DumpMDOAtExit && MDOReplayDumpFile != nullptr) {
     log_info(compilation)("MDO replay: will dump profiles to %s", MDOReplayDumpFile);
-    fileStream fs(MDOReplayDumpFile, "w");
+    fileStream fs(MDOReplayDumpFile, "wb");
     if (fs.is_open()) {
-      // Emit a minimal header
-      fs.print_cr("# mdo-replay (MethodData only)");
       // Run at a safepoint to avoid concurrent MDO mutations during dump
       class VM_MDOReplayDump : public VM_Operation {
         fileStream* _out;
@@ -318,7 +316,9 @@ void print_statistics() {
         VM_MDOReplayDump(fileStream* out) : _out(out) {}
         virtual VMOp_Type type() const { return VMOp_GC_HeapInspection; }
         virtual void doit() {
-          MDOReplayDump::dump_all(_out);
+          ProfileCheckpoint::Writer* dummy = nullptr; // include dependency anchor
+          (void)dummy;
+          ProfileCheckpoint::dump_to_stream(_out);
         }
       } op(&fs);
       VMThread::execute(&op);

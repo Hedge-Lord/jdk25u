@@ -93,7 +93,7 @@
 #include "utilities/events.hpp"
 #include "utilities/macros.hpp"
 #include "utilities/vmError.hpp"
-#include "services/mdoReplayLoad.hpp"
+#include "services/profileCheckpoint.hpp"
 #if INCLUDE_JVMCI
 #include "jvmci/jvmciCompiler.hpp"
 #endif
@@ -3621,7 +3621,7 @@ static jint JNI_CreateJavaVM_inner(JavaVM **vm, void **penv, void *args) {
 
     if (ReplayCompiles) ciReplay::replay(thread);
     if (LoadMDOAtStartup && MDOReplayLoadFile != nullptr) {
-      MDOReplayLoad::load(thread);
+      ProfileCheckpoint::load(thread);
     }
 
 #ifdef ASSERT
