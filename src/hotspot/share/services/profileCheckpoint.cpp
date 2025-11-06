@@ -273,7 +273,7 @@ bool ProfileCheckpoint::Header::read(FILE* in, Header& h) {
   if (!read_u4(in, h.rec_count)) return false;
   return true;
 }
-
+         
 static u2 detect_endianness() {
   union { u4 v; u1 b[4]; } u; u.v = 1;
   return (u.b[0] == 1) ? (u2)0 : (u2)1;
@@ -429,9 +429,15 @@ void ProfileCheckpoint::load(JavaThread* THREAD) {
             // Restore MethodCounters snapshot if present and counters object exists
             if (rec.mc_size > 0) {
               MethodCounters* mc = target->method_counters();
+              if (mc == nullptr) {
+                methodHandle mh(THREAD, target);
+                MethodCounters* ensured = Method::build_method_counters(THREAD, target);
+                if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+                mc = ensured;
+              }
               if (mc != nullptr) {
                 const size_t ic_sz = sizeof(InvocationCounter);
-                if (rec.mc_size >= ic_sz * 2 + sizeof(jlong) + sizeof(float) + sizeof(jint) + 2 * sizeof(u1)) {
+                if (rec.mc_size >= ic_sz * 2 + sizeof(jlong) + sizeof(float) + sizeof(jint)) {
                   char* p = mc_bytes;
                   // invocation counter
                   Copy::conjoint_jbytes(p, (char*)mc->invocation_counter(), (jlong)ic_sz); p += ic_sz;
@@ -446,11 +452,6 @@ void ProfileCheckpoint::load(JavaThread* THREAD) {
                   // prev_event_count
                   jint pec = *(jint*)p; p += sizeof(jint);
                   mc->set_prev_event_count(pec);
-                  // highest levels
-                  int hc = (int)(u1)(*p++);
-                  int hosr = (int)(u1)(*p++);
-                  mc->set_highest_comp_level(hc);
-                  mc->set_highest_osr_comp_level(hosr);
                 }
               }
             }
@@ -601,7 +602,7 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
     MethodCounters* mc = m->method_counters();
     if (mc != nullptr) {
       const size_t ic_sz = sizeof(InvocationCounter);
-      const size_t mc_sz = ic_sz * 2 + sizeof(jlong) + sizeof(float) + sizeof(jint) + 2 * sizeof(u1);
+      const size_t mc_sz = ic_sz * 2 + sizeof(jlong) + sizeof(float) + sizeof(jint);
       for (size_t fill = 0; fill < mc_sz; fill++) mc_buf.append((char)0);
       char* p = mc_buf.adr_at(0);
       // invocation counter
@@ -616,9 +617,6 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
       *(float*)p = mc->rate(); p += sizeof(float);
       // prev_event_count
       *(jint*)p = mc->prev_event_count(); p += sizeof(jint);
-      // highest levels
-      *p++ = (u1)mc->highest_comp_level();
-      *p++ = (u1)mc->highest_osr_comp_level();
       rec.mc_size = (u4)mc_sz;
       mc_bytes = mc_buf.adr_at(0);
     } else {
