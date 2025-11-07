@@ -3,6 +3,7 @@
 
 #include "utilities/globalDefinitions.hpp"
 #include <stdio.h>
+#include "utilities/growableArray.hpp"
 
 class fileStream;
 
@@ -64,6 +65,15 @@ public:
     ByteRange mc_fixups   {0,0};
   };
 
+  // Minimal metadata per-record used during dump before IDs are frozen
+  struct RecMeta {
+    const char* kname;
+    const char* mname;
+    const char* sig;
+    u4          mdo_size;
+    const void* mdo_ptr;
+  };
+
    struct Header {
     char magic[4];
     u4   version;
@@ -103,6 +113,19 @@ public:
     explicit Reader(FILE* in) : _in(in) {}
     bool read_header(Header& h) { return Header::read(_in, h); }
     bool read_record(Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes) { return Record::read(_in, r, fixups, mdo_bytes, mc_bytes); }
+  };
+
+  class SymtabBuilder {
+  private:
+    GrowableArray<const char*> _syms;
+    bool                        _frozen;
+  public:
+    SymtabBuilder() : _syms(256), _frozen(false) {}
+    u4 intern(const char* s);
+    u4 id_of(const char* s) const;
+    void freeze() { _frozen = true; }
+    u4 length() const { return (u4)_syms.length(); }
+    bool write(fileStream* out) const;
   };
 
   static void load(class JavaThread* THREAD);
