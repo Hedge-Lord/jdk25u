@@ -13,6 +13,9 @@
 #include "utilities/copy.hpp"
 #include "runtime/os.hpp"
 #include "runtime/globals.hpp"
+#include "compiler/compilationPolicy.hpp"
+#include "compiler/compileBroker.hpp"
+#include "compiler/compilerDefinitions.hpp"
 #include <cstdio>
 #include <cstring>
 
@@ -80,13 +83,9 @@ static void sanitize_type_entries(MethodData* mdo) {
   }
 }
 
-struct FixupText {
-  u4 offset_in_mdo;
-  ProfileCheckpoint::FixupKind kind;
-  const char* name; // klass internal name
-};
-
-static void collect_type_fixups_text(MethodData* mdo, GrowableArray<FixupText>& out_fixups) {
+static void collect_type_fixups(MethodData* mdo,
+                                ProfileCheckpoint::SymtabBuilder& stb,
+                                GrowableArray<ProfileCheckpoint::Fixup>& out_fixups) {
   for (ProfileData* pd = mdo->first_data(); mdo->is_valid(pd); pd = mdo->next_data(pd)) {
     if (pd->is_VirtualCallData() || pd->is_ReceiverTypeData()) {
       ReceiverTypeData* rtd = pd->as_ReceiverTypeData();
@@ -96,8 +95,10 @@ static void collect_type_fixups_text(MethodData* mdo, GrowableArray<FixupText>& 
         Klass* k = TypeEntries::valid_klass(*cell);
         if (k != nullptr && k->is_instance_klass()) {
           const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
-          FixupText fx; fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-          fx.kind = ProfileCheckpoint::FixupKind::KLASS; fx.name = cname;
+          ProfileCheckpoint::Fixup fx;
+          fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
+          fx.kind = ProfileCheckpoint::FixupKind::KLASS;
+          fx.target.id = stb.intern(cname);
           out_fixups.append(fx);
         }
       }
@@ -111,8 +112,10 @@ static void collect_type_fixups_text(MethodData* mdo, GrowableArray<FixupText>& 
           Klass* k = TypeEntries::valid_klass(*cell);
           if (k != nullptr && k->is_instance_klass()) {
             const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
-            FixupText fx; fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-            fx.kind = ProfileCheckpoint::FixupKind::KLASS; fx.name = cname;
+            ProfileCheckpoint::Fixup fx;
+            fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
+            fx.kind = ProfileCheckpoint::FixupKind::KLASS;
+            fx.target.id = stb.intern(cname);
             out_fixups.append(fx);
           }
         }
@@ -123,8 +126,10 @@ static void collect_type_fixups_text(MethodData* mdo, GrowableArray<FixupText>& 
         Klass* k = TypeEntries::valid_klass(*cell);
         if (k != nullptr && k->is_instance_klass()) {
           const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
-          FixupText fx; fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-          fx.kind = ProfileCheckpoint::FixupKind::KLASS; fx.name = cname;
+          ProfileCheckpoint::Fixup fx;
+          fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
+          fx.kind = ProfileCheckpoint::FixupKind::KLASS;
+          fx.target.id = stb.intern(cname);
           out_fixups.append(fx);
         }
       }
@@ -138,8 +143,10 @@ static void collect_type_fixups_text(MethodData* mdo, GrowableArray<FixupText>& 
           Klass* k = TypeEntries::valid_klass(*cell);
           if (k != nullptr && k->is_instance_klass()) {
             const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
-            FixupText fx; fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-            fx.kind = ProfileCheckpoint::FixupKind::KLASS; fx.name = cname;
+            ProfileCheckpoint::Fixup fx;
+            fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
+            fx.kind = ProfileCheckpoint::FixupKind::KLASS;
+            fx.target.id = stb.intern(cname);
             out_fixups.append(fx);
           }
         }
@@ -150,8 +157,10 @@ static void collect_type_fixups_text(MethodData* mdo, GrowableArray<FixupText>& 
         Klass* k = TypeEntries::valid_klass(*cell);
         if (k != nullptr && k->is_instance_klass()) {
           const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
-          FixupText fx; fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-          fx.kind = ProfileCheckpoint::FixupKind::KLASS; fx.name = cname;
+          ProfileCheckpoint::Fixup fx;
+          fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
+          fx.kind = ProfileCheckpoint::FixupKind::KLASS;
+          fx.target.id = stb.intern(cname);
           out_fixups.append(fx);
         }
       }
@@ -165,8 +174,10 @@ static void collect_type_fixups_text(MethodData* mdo, GrowableArray<FixupText>& 
       Klass* k = TypeEntries::valid_klass(*cell);
       if (k != nullptr && k->is_instance_klass()) {
         const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
-        FixupText fx; fx.offset_in_mdo = (u4)((p_dp + off_b) - (address)mdo);
-        fx.kind = ProfileCheckpoint::FixupKind::KLASS; fx.name = cname;
+        ProfileCheckpoint::Fixup fx;
+        fx.offset_in_mdo = (u4)((p_dp + off_b) - (address)mdo);
+        fx.kind = ProfileCheckpoint::FixupKind::KLASS;
+        fx.target.id = stb.intern(cname);
         out_fixups.append(fx);
       }
     }
@@ -229,12 +240,6 @@ static bool write_u4(fileStream* out, u4 v) {
 
 static bool read_u4(FILE* in, u4& v) {
   return read_exact(in, &v, sizeof(v));
-}
-
-static bool write_str(fileStream* out, const char* s) {
-  u4 len = (u4)strlen(s);
-  if (!write_u4(out, len)) return false;
-  return write_exact(out, s, len);
 }
 
 static char* read_str(FILE* in) {
@@ -354,9 +359,25 @@ bool ProfileCheckpoint::Record::read(FILE* in, Record& r, Fixup*& fixups, char*&
   return true;
 }
 
-// --- Restore support (minimal v1): resolve by system loader, link, alloc MDO, memcpy, sanitize ---
+ProfileCheckpoint::Loader::Loader(JavaThread* thread)
+  : _thread(thread),
+    _records_read(0),
+    _records_installed(0),
+    _size_mismatch(0) {}
 
-static InstanceKlass* resolve_klass_utf8(const char* name, TRAPS) {
+const char* ProfileCheckpoint::Loader::load_status_name(LoadStatus status) {
+  switch (status) {
+    case LoadStatus::Success:          return "success";
+    case LoadStatus::MissingPath:      return "missing_path";
+    case LoadStatus::FileOpenFailed:   return "file_open_failed";
+    case LoadStatus::HeaderInvalid:    return "header_invalid";
+    case LoadStatus::SymtabReadFailed: return "symtab_read_failed";
+    case LoadStatus::RecordReadFailed: return "record_read_failed";
+    default:                           return "unknown";
+  }
+}
+
+InstanceKlass* ProfileCheckpoint::Loader::resolve_klass_utf8(const char* name, TRAPS) {
   Symbol* sym = SymbolTable::new_symbol(name);
   oop sys_loader_oop = SystemDictionary::java_system_loader();
   Handle loader(THREAD, sys_loader_oop);
@@ -365,11 +386,172 @@ static InstanceKlass* resolve_klass_utf8(const char* name, TRAPS) {
   return (k != nullptr && k->is_instance_klass()) ? InstanceKlass::cast(k) : nullptr;
 }
 
-static Method* resolve_method_utf8(InstanceKlass* ik, const char* mname, const char* msig) {
+Method* ProfileCheckpoint::Loader::resolve_method_utf8(InstanceKlass* ik, const char* mname, const char* msig) {
   if (ik == nullptr) return nullptr;
   Symbol* mn = SymbolTable::new_symbol(mname);
   Symbol* sg = SymbolTable::new_symbol(msig);
   return ik->find_method(mn, sg);
+}
+
+bool ProfileCheckpoint::Loader::install_record(const Record& rec,
+                                               Fixup* fixups,
+                                               char* mdo_bytes,
+                                               char* mc_bytes,
+                                               GrowableArray<char*>& symtab) {
+  JavaThread* THREAD = _thread; // For exception macros.
+  const char* kname = symtab.at((int)rec.key.klass.id);
+  const char* mname = symtab.at((int)rec.key.name.id);
+  const char* msig  = symtab.at((int)rec.key.sig.id);
+
+  InstanceKlass* holder = resolve_klass_utf8(kname, THREAD);
+  if (holder == nullptr) {
+    log_debug(compilation)("MDO checkpoint: resolve class failed for %s", kname);
+    return false;
+  }
+  Method* target = resolve_method_utf8(holder, mname, msig);
+  if (target == nullptr) {
+    log_debug(compilation)("MDO checkpoint: resolve method failed for %s %s %s", kname, mname, msig);
+    return false;
+  }
+
+  holder->link_class(THREAD);
+  if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+
+  if (target->method_data() == nullptr) {
+    methodHandle mh(THREAD, target);
+    target->build_profiling_method_data(mh, THREAD);
+    if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+  }
+
+  MethodData* mdo = target->method_data();
+  if (mdo == nullptr) {
+    log_debug(compilation)("MDO checkpoint: MethodData allocation/build failed for %s %s %s", kname, mname, msig);
+    return false;
+  }
+
+  if (!copy_mdo_payload(mdo, mdo_bytes, rec.mdo_size)) {
+    log_debug(compilation)("MDO checkpoint: copy payload failed for %s %s %s (size=%u)", kname, mname, msig, rec.mdo_size);
+    _size_mismatch++;
+    return false;
+  }
+
+  sanitize_type_entries(mdo);
+  if (fixups != nullptr && rec.fixup_count > 0) {
+    apply_fixups(mdo, fixups, rec.fixup_count, symtab, rec.key.loader, THREAD);
+  }
+
+  _records_installed++;
+
+  if (rec.mc_size > 0) {
+    MethodCounters* mc = target->method_counters();
+    if (mc == nullptr) {
+      methodHandle mh(THREAD, target);
+      MethodCounters* ensured = Method::build_method_counters(THREAD, target);
+      if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+      mc = ensured;
+    }
+    if (mc != nullptr) {
+      const size_t ic_sz = sizeof(InvocationCounter);
+      if (rec.mc_size >= ic_sz * 2 + sizeof(jlong) + sizeof(float) + sizeof(jint)) {
+        char* p = mc_bytes;
+        Copy::conjoint_jbytes(p, (char*)mc->invocation_counter(), (jlong)ic_sz); p += ic_sz;
+        Copy::conjoint_jbytes(p, (char*)mc->backedge_counter(), (jlong)ic_sz); p += ic_sz;
+        jlong prev_time = *(jlong*)p; p += sizeof(jlong);
+        mc->set_prev_time(prev_time);
+        float rate = *(float*)p; p += sizeof(float);
+        mc->set_rate(rate);
+        jint pec = *(jint*)p; p += sizeof(jint);
+        mc->set_prev_event_count(pec);
+      }
+    }
+  }
+
+  if (PrintMDOAfterLoad) {
+    tty->print_cr("[AfterLoad] %s %s %s", kname, mname, msig);
+    tty->print_cr("[MethodData]");
+    mdo->print_data_on(tty);
+    tty->print_cr("[MethodCounters]");
+    MethodCounters* mc = target->method_counters();
+    if (mc != nullptr) {
+      mc->print_data_on(tty);
+    } else {
+      tty->print_cr("  (none)");
+    }
+  }
+
+  return true;
+}
+
+ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(const char* path) {
+  LoadResult result{LoadStatus::MissingPath, 0, 0, 0};
+  if (path == nullptr) {
+    return result;
+  }
+
+  FILE* f = os::fopen(path, "rb");
+  if (f == nullptr) {
+    result.status = LoadStatus::FileOpenFailed;
+    return result;
+  }
+
+  ResourceMark rm;
+  BinaryStreamReader reader(f);
+
+  Header hdr;
+  if (!reader.read_header(hdr)) {
+    fclose(f);
+    result.status = LoadStatus::HeaderInvalid;
+    return result;
+  }
+  u4 sym_count = hdr.sym_count;
+  u4 rec_total = hdr.rec_count;
+  GrowableArray<char*> symtab((int)sym_count);
+  if (!reader.read_symtab(symtab, sym_count)) {
+    fclose(f);
+    result.status = LoadStatus::SymtabReadFailed;
+    return result;
+  }
+
+  result.status = LoadStatus::Success;
+
+  for (u4 i = 0; i < rec_total; i++) {
+    Record rec;
+    Fixup* fixups = nullptr;
+    char* mdo_bytes = nullptr;
+    char* mc_bytes = nullptr;
+    if (!reader.read_record(rec, fixups, mdo_bytes, mc_bytes)) {
+      log_debug(compilation)("MDO checkpoint: record read failed at %u", i);
+      result.status = LoadStatus::RecordReadFailed;
+      if (fixups) os::free(fixups);
+      if (mdo_bytes) os::free(mdo_bytes);
+      if (mc_bytes) os::free(mc_bytes);
+      break;
+    }
+
+    _records_read++;
+
+    if (rec.mdo_size == 0) {
+      log_debug(compilation)("MDO checkpoint: empty MDO payload for sym ids %u %u %u",
+                             rec.key.klass.id, rec.key.name.id, rec.key.sig.id);
+      if (fixups) os::free(fixups);
+      if (mdo_bytes) os::free(mdo_bytes);
+      if (mc_bytes) os::free(mc_bytes);
+      continue;
+    }
+
+    install_record(rec, fixups, mdo_bytes, mc_bytes, symtab);
+
+    if (fixups != nullptr) os::free(fixups);
+    if (mdo_bytes != nullptr) os::free(mdo_bytes);
+    if (mc_bytes != nullptr) os::free(mc_bytes);
+  }
+
+  fclose(f);
+
+  result.records_read = _records_read;
+  result.records_installed = _records_installed;
+  result.size_mismatch = _size_mismatch;
+  return result;
 }
 
 // Build RecMeta (holder/name/sig/mdo size/pointer) for a method with an MDO
@@ -419,140 +601,76 @@ u4 ProfileCheckpoint::SymtabBuilder::id_of(const char* s) const {
   return (u4)UINT_MAX;
 }
 
-bool ProfileCheckpoint::SymtabBuilder::write(fileStream* out) const {
-  for (int i = 0; i < _syms.length(); i++) {
-    const char* s = _syms.at(i);
+bool ProfileCheckpoint::BinaryStreamWriter::write_header(u4 sym_count, u4 rec_count) {
+  Header h;
+  Header::init(h, sym_count, rec_count);
+  return Header::write(_out, h);
+}
+
+bool ProfileCheckpoint::BinaryStreamWriter::write_symtab(const GrowableArray<const char*>& symbols) const {
+  for (int i = 0; i < symbols.length(); i++) {
+    const char* s = symbols.at(i);
     u4 len = (u4)strlen(s);
-    if (!write_u4(out, len)) return false;
-    if (!write_exact(out, s, len)) return false;
+    if (!write_u4(_out, len)) return false;
+    if (!write_exact(_out, s, len)) return false;
   }
   return true;
 }
 
+bool ProfileCheckpoint::BinaryStreamWriter::write_record(const Record& r, const void* mdo_bytes,
+                                                         const Fixup* fixups, const void* mc_bytes) const {
+  return Record::write(_out, r, mdo_bytes, fixups, mc_bytes);
+}
+
+bool ProfileCheckpoint::BinaryStreamReader::read_header(Header& h) const {
+  return Header::read(_in, h);
+}
+
+bool ProfileCheckpoint::BinaryStreamReader::read_symtab(GrowableArray<char*>& symbols, u4 expected) const {
+  for (u4 si = 0; si < expected; si++) {
+    char* s = read_str(_in);
+    if (s == nullptr) {
+      return false;
+    }
+    symbols.append(s);
+  }
+  return true;
+}
+
+bool ProfileCheckpoint::BinaryStreamReader::read_record(Record& r, Fixup*& fixups,
+                                                        char*& mdo_bytes, char*& mc_bytes) const {
+  return Record::read(_in, r, fixups, mdo_bytes, mc_bytes);
+}
 
 void ProfileCheckpoint::load(JavaThread* THREAD) {
   if (!LoadMDOAtStartup || MDOReplayLoadFile == nullptr) return;
-  FILE* f = os::fopen(MDOReplayLoadFile, "rb");
-  if (f == nullptr) { return; }
-  ResourceMark rm;
-  log_info(compilation)("MDO checkpoint: loading (binary) from %s", MDOReplayLoadFile);
-
-  ProfileCheckpoint::Header hdr;
-  if (!ProfileCheckpoint::Header::read(f, hdr)) { fclose(f); return; }
-  u4 sym_count = hdr.sym_count;
-  u4 rec_total = hdr.rec_count;
-  // Read symtab
-  GrowableArray<char*> symtab((int)sym_count);
-  for (u4 si = 0; si < sym_count; si++) {
-    char* s = read_str(f);
-    if (s == nullptr) { fclose(f); return; }
-    symtab.append(s);
-  }
-  int records_read = 0;
-  int records_installed = 0;
-  int size_mismatch = 0;
-
-  for (u4 i = 0; i < rec_total; i++) {
-    ProfileCheckpoint::Record rec;
-    ProfileCheckpoint::Fixup* fixups = nullptr;
-    char* mdo_bytes = nullptr;
-    char* mc_bytes = nullptr;
-    if (!ProfileCheckpoint::Record::read(f, rec, fixups, mdo_bytes, mc_bytes)) { log_debug(compilation)("MDO checkpoint: record read failed at %u", i); break; }
-    const char* kname = symtab.at((int)rec.key.klass.id);
-    const char* mname = symtab.at((int)rec.key.name.id);
-    const char* msig  = symtab.at((int)rec.key.sig.id);
-    records_read++;
-    if (rec.mdo_size == 0) { log_debug(compilation)("MDO checkpoint: empty MDO payload for %s %s %s", kname, mname, msig); if (fixups) os::free(fixups); if (mdo_bytes) os::free(mdo_bytes); continue; }
-
-    InstanceKlass* holder = resolve_klass_utf8(kname, THREAD);
-    if (holder != nullptr) {
-      Method* target = resolve_method_utf8(holder, mname, msig);
-      if (target != nullptr) {
-        holder->link_class(THREAD);
-        if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
-        if (target->method_data() == nullptr) {
-          methodHandle mh(THREAD, target);
-          target->build_profiling_method_data(mh, CHECK);
-          if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
-        }
-        MethodData* mdo = target->method_data();
-        if (mdo != nullptr) {
-          if (copy_mdo_payload(mdo, mdo_bytes, rec.mdo_size)) {
-            sanitize_type_entries(mdo);
-            if (fixups != nullptr && rec.fixup_count > 0) {
-              apply_fixups(mdo, fixups, rec.fixup_count, symtab, rec.key.loader, THREAD);
-            }
-
-            records_installed++;
-            // Restore MethodCounters snapshot if present and counters object exists
-            if (rec.mc_size > 0) {
-              MethodCounters* mc = target->method_counters();
-              if (mc == nullptr) {
-                methodHandle mh(THREAD, target);
-                MethodCounters* ensured = Method::build_method_counters(THREAD, target);
-                if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
-                mc = ensured;
-              }
-              if (mc != nullptr) {
-                const size_t ic_sz = sizeof(InvocationCounter);
-                if (rec.mc_size >= ic_sz * 2 + sizeof(jlong) + sizeof(float) + sizeof(jint)) {
-                  char* p = mc_bytes;
-                  // invocation counter
-                  Copy::conjoint_jbytes(p, (char*)mc->invocation_counter(), (jlong)ic_sz); p += ic_sz;
-                  // backedge counter
-                  Copy::conjoint_jbytes(p, (char*)mc->backedge_counter(), (jlong)ic_sz); p += ic_sz;
-                  // prev_time
-                  jlong prev_time = *(jlong*)p; p += sizeof(jlong);
-                  mc->set_prev_time(prev_time);
-                  // rate
-                  float rate = *(float*)p; p += sizeof(float);
-                  mc->set_rate(rate);
-                  // prev_event_count
-                  jint pec = *(jint*)p; p += sizeof(jint);
-                  mc->set_prev_event_count(pec);
-                }
-              }
-            }
-            if (PrintMDOAfterLoad) {
-              tty->print_cr("[AfterLoad] %s %s %s", kname, mname, msig);
-              tty->print_cr("[MethodData]");
-              mdo->print_data_on(tty);
-              tty->print_cr("[MethodCounters]");
-              MethodCounters* mc = target->method_counters();
-              if (mc != nullptr) {
-                mc->print_data_on(tty);
-              } else {
-                tty->print_cr("  (none)");
-              }
-            }
-          } else {
-            log_debug(compilation)("MDO checkpoint: copy payload failed for %s %s %s (size=%u)", kname, mname, msig, rec.mdo_size);
-            size_mismatch++;
-          }
-        } else {
-          log_debug(compilation)("MDO checkpoint: MethodData allocation/build failed for %s %s %s", kname, mname, msig);
-        }
-      } else {
-        log_debug(compilation)("MDO checkpoint: resolve method failed for %s %s %s", kname, mname, msig);
-      }
-    } else {
-      log_debug(compilation)("MDO checkpoint: resolve class failed for %s", kname);
+  Loader loader(THREAD);
+  log_info(compilation)("MDO checkpoint: initiating load from %s", MDOReplayLoadFile);
+  Loader::LoadResult res = loader.load_from_file(MDOReplayLoadFile);
+  if (res.ok()) {
+    log_info(compilation)("MDO checkpoint: loaded %d records (%d installed, %d size mismatch)",
+                          res.records_read, res.records_installed, res.size_mismatch);
+    if (EagerCompileAllLoaded) {
+      eager_compile_after_load(THREAD);
     }
-    if (fixups != nullptr) os::free(fixups);
-    if (mdo_bytes != nullptr) os::free(mdo_bytes);
-    if (mc_bytes != nullptr) os::free(mc_bytes);
+  } else {
+    log_warning(compilation)("MDO checkpoint: load failed (status=%s, read=%d, installed=%d, mismatches=%d)",
+                             Loader::load_status_name(res.status),
+                             res.records_read,
+                             res.records_installed,
+                             res.size_mismatch);
   }
-  fclose(f);
-  log_info(compilation)("MDO checkpoint: loaded %d records (%d installed, %d size mismatch)",
-                        records_read, records_installed, size_mismatch);
 }
 
-void ProfileCheckpoint::dump_to_stream(fileStream* out) {
+bool ProfileCheckpoint::Loader::dump_to_stream(fileStream* out) {
+  if (out == nullptr) {
+    return false;
+  }
+
   ResourceMark rm;
   GrowableArray<Method*> methods = get_methods();
-  // Symtab builder and record metadata
-  ProfileCheckpoint::SymtabBuilder stb;
-  GrowableArray<ProfileCheckpoint::RecMeta> recs(1024);
+  SymtabBuilder stb;
+  GrowableArray<RecMeta> recs(1024);
 
   for (int i = 0; i < methods.length(); i++) {
     Method* m = methods.at(i);
@@ -560,38 +678,36 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
     recs.append(make_rec_meta_for_method(m));
   }
 
-  // Pre-scan all methods to collect fixups as raw strings
-  GrowableArray< GrowableArray<FixupText>* > fixups_per_rec(recs.length());
+  GrowableArray< GrowableArray<Fixup>* > fixups_per_rec(recs.length());
   for (int ri = 0; ri < recs.length(); ri++) {
     Method* m = methods.at(ri);
     MethodData* mdo = m->method_data();
-    GrowableArray<FixupText>* fx = new GrowableArray<FixupText>(16);
-    collect_type_fixups_text(mdo, *fx);
+    GrowableArray<Fixup>* fx = new GrowableArray<Fixup>(16);
+    collect_type_fixups(mdo, stb, *fx);
     fixups_per_rec.append(fx);
   }
 
-  // Build symtab from all names: method keys + fixup names
   for (int ri = 0; ri < recs.length(); ri++) {
     stb.intern(recs.at(ri).kname);
     stb.intern(recs.at(ri).mname);
     stb.intern(recs.at(ri).sig);
-    GrowableArray<FixupText>* fx = fixups_per_rec.at(ri);
-    for (int i = 0; i < fx->length(); i++) stb.intern(fx->at(i).name);
   }
   stb.freeze();
 
-  // Now write finalized header and symtab
-  ProfileCheckpoint::Writer writer(out);
-  writer.write_header(stb.length(), (u4)recs.length());
-  stb.write(out);
+  BinaryStreamWriter writer(out);
+  if (!writer.write_header(stb.length(), (u4)recs.length())) {
+    return false;
+  }
+  if (!writer.write_symtab(stb.symbols())) {
+    return false;
+  }
 
-  // Write records using pre-built fixups
   u4 emitted = 0;
   for (int ri = 0; ri < recs.length(); ri++) {
-    const ProfileCheckpoint::RecMeta& rn = recs.at(ri);
+    const RecMeta& rn = recs.at(ri);
     Method* m = methods.at(ri);
     MethodData* mdo = m->method_data();
-    ProfileCheckpoint::Record rec;
+    Record rec;
     oop cl = m->method_holder()->class_loader();
     if (cl == nullptr) {
       rec.key.loader = LoaderId::BOOT;
@@ -605,13 +721,9 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
     rec.key.sig.id   = stb.id_of(rn.sig);
     rec.key.bytecode_crc32 = 0;
     rec.mdo_size = rn.mdo_size;
-    GrowableArray<FixupText>* fx_text = fixups_per_rec.at(ri);
-    GrowableArray<Fixup> fx_ids(fx_text->length());
-    for (int i = 0; i < fx_text->length(); i++) {
-      Fixup fxi; fxi.offset_in_mdo = fx_text->at(i).offset_in_mdo; fxi.kind = fx_text->at(i).kind; fxi.target.id = stb.id_of(fx_text->at(i).name); fx_ids.append(fxi);
-    }
-    rec.fixup_count = (u4)fx_ids.length();
-    // Build MethodCounters snapshot (optional)
+    GrowableArray<Fixup>* fx_entries = fixups_per_rec.at(ri);
+    rec.fixup_count = (u4)fx_entries->length();
+
     const void* mc_bytes = nullptr;
     GrowableArray<char> mc_buf(0);
     MethodCounters* mc = m->method_counters();
@@ -620,24 +732,22 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
       const size_t mc_sz = ic_sz * 2 + sizeof(jlong) + sizeof(float) + sizeof(jint);
       for (size_t fill = 0; fill < mc_sz; fill++) mc_buf.append((char)0);
       char* p = mc_buf.adr_at(0);
-      // invocation counter
       Copy::conjoint_jbytes((char*)mc->invocation_counter(), p, (jlong)ic_sz);
       p += ic_sz;
-      // backedge counter
       Copy::conjoint_jbytes((char*)mc->backedge_counter(), p, (jlong)ic_sz);
       p += ic_sz;
-      // prev_time
       *(jlong*)p = mc->prev_time(); p += sizeof(jlong);
-      // rate
       *(float*)p = mc->rate(); p += sizeof(float);
-      // prev_event_count
       *(jint*)p = mc->prev_event_count(); p += sizeof(jint);
       rec.mc_size = (u4)mc_sz;
       mc_bytes = mc_buf.adr_at(0);
     } else {
       rec.mc_size = 0;
     }
-    ProfileCheckpoint::Record::write(out, rec, rn.mdo_ptr, rec.fixup_count ? fx_ids.adr_at(0) : nullptr, mc_bytes);
+    Fixup* fixup_buf = rec.fixup_count ? fx_entries->adr_at(0) : nullptr;
+    if (!writer.write_record(rec, rn.mdo_ptr, fixup_buf, mc_bytes)) {
+      return false;
+    }
     if (PrintMDOAtDump) {
       const char* kname = rn.kname;
       const char* mname = rn.mname;
@@ -646,9 +756,9 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
       tty->print_cr("[MethodData]");
       mdo->print_data_on(tty);
       tty->print_cr("[MethodCounters]");
-      MethodCounters* mc = m->method_counters();
-      if (mc != nullptr) {
-        mc->print_data_on(tty);
+      MethodCounters* mc_print = m->method_counters();
+      if (mc_print != nullptr) {
+        mc_print->print_data_on(tty);
       } else {
         tty->print_cr("  (none)");
       }
@@ -656,6 +766,70 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
     emitted++;
   }
   log_info(compilation)("MDO checkpoint: dumped %u MDOs (sym=%u)", emitted, stb.length());
+  return true;
+}
+
+void ProfileCheckpoint::dump_to_stream(fileStream* out) {
+  if (!Loader::dump_to_stream(out)) {
+    log_warning(compilation)("MDO checkpoint: dump failed");
+  }
+}
+
+
+void ProfileCheckpoint::eager_compile_after_load(JavaThread* THREAD) {
+  if (!UseCompiler || !CompilationPolicy::is_compilation_enabled()) {
+    return;
+  }
+  log_info(compilation)("Eager compiling all loaded methods");
+  // Optionally run <clinit> on the specified main class
+  if (EagerMainClass != nullptr) {
+    ResourceMark rm(THREAD);
+    const char* dotted = EagerMainClass;
+    size_t len = strlen(dotted);
+    char* slash_name = NEW_RESOURCE_ARRAY(char, len + 1);
+    for (size_t i = 0; i < len; i++) {
+      char c = dotted[i];
+      slash_name[i] = (c == '.') ? '/' : c;
+    }
+    slash_name[len] = '\0';
+    TempNewSymbol name_sym = SymbolTable::new_symbol(slash_name);
+    Klass* k = SystemDictionary::resolve_or_null(name_sym, THREAD);
+    if (k != nullptr) {
+      InstanceKlass* ik = InstanceKlass::cast(k);
+      if (!ik->is_initialized()) {
+        ik->initialize(THREAD);
+        if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+      }
+    }
+  }
+
+  // Visit all loaded methods and trigger the standard policy transition.
+  struct EagerCompileVisitor {
+    static void visit(Method* m) {
+      if (m == nullptr) return;
+      if (m->is_abstract() || m->is_native()) return;
+      JavaThread* THREAD = JavaThread::current(); // For exception macros.
+      methodHandle mh(THREAD, m);
+      nmethod* code = m->code();
+      CompLevel level = (code != nullptr && code->is_in_use()) ? (CompLevel)code->comp_level() : CompLevel_none;
+      // Standard transition for normal invocation events.
+      CompilationPolicy::event(mh, mh, InvocationEntryBci, InvocationEntryBci, level, nullptr, THREAD);
+      if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+    }
+  };
+  SystemDictionary::methods_do(EagerCompileVisitor::visit);
+
+  // Block until compile queues are drained and no active tasks remain.
+  for (;;) {
+    CompileBroker::wait_for_no_active_tasks();
+    CompileQueue* q1 = CompileBroker::c1_compile_queue();
+    CompileQueue* q2 = CompileBroker::c2_compile_queue();
+    bool empty1 = (q1 == nullptr) || q1->is_empty();
+    bool empty2 = (q2 == nullptr) || q2->is_empty();
+    if (empty1 && empty2) break;
+    os::naked_short_sleep(1);
+  }
+  log_info(compilation)("Eager compilation completed");
 }
 
 

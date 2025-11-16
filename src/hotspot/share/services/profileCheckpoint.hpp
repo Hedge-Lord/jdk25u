@@ -99,20 +99,23 @@ public:
      static bool read(FILE* in, Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes);
    };
 
-  class Writer {
+  class BinaryStreamWriter {
     fileStream* _out;
   public:
-    explicit Writer(fileStream* out) : _out(out) {}
-    bool write_header(u4 sym_count, u4 rec_count) { Header h; Header::init(h, sym_count, rec_count); return Header::write(_out, h); }
-    bool write_record(const Record& r, const void* mdo_bytes, const Fixup* fixups, const void* mc_bytes) { return Record::write(_out, r, mdo_bytes, fixups, mc_bytes); }
+    explicit BinaryStreamWriter(fileStream* out) : _out(out) {}
+    bool write_header(u4 sym_count, u4 rec_count);
+    bool write_symtab(const GrowableArray<const char*>& symbols) const;
+    bool write_record(const Record& r, const void* mdo_bytes,
+                      const Fixup* fixups, const void* mc_bytes) const;
   };
 
-  class Reader {
+  class BinaryStreamReader {
     FILE* _in;
   public:
-    explicit Reader(FILE* in) : _in(in) {}
-    bool read_header(Header& h) { return Header::read(_in, h); }
-    bool read_record(Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes) { return Record::read(_in, r, fixups, mdo_bytes, mc_bytes); }
+    explicit BinaryStreamReader(FILE* in) : _in(in) {}
+    bool read_header(Header& h) const;
+    bool read_symtab(GrowableArray<char*>& symbols, u4 expected) const;
+    bool read_record(Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes) const;
   };
 
   class SymtabBuilder {
@@ -125,11 +128,53 @@ public:
     u4 id_of(const char* s) const;
     void freeze() { _frozen = true; }
     u4 length() const { return (u4)_syms.length(); }
-    bool write(fileStream* out) const;
+    const GrowableArray<const char*>& symbols() const { return _syms; }
+  };
+
+  class Loader {
+  public:
+    enum class LoadStatus {
+      Success,
+      MissingPath,
+      FileOpenFailed,
+      HeaderInvalid,
+      SymtabReadFailed,
+      RecordReadFailed
+    };
+
+    struct LoadResult {
+      LoadStatus status;
+      int records_read;
+      int records_installed;
+      int size_mismatch;
+      bool ok() const { return status == LoadStatus::Success; }
+    };
+
+    explicit Loader(class JavaThread* thread);
+    LoadResult load_from_file(const char* path);
+    static const char* load_status_name(LoadStatus status);
+    static bool dump_to_stream(fileStream* out);
+  private:
+    class JavaThread* _thread;
+    int _records_read;
+    int _records_installed;
+    int _size_mismatch;
+
+    bool install_record(const Record& rec,
+                        Fixup* fixups,
+                        char* mdo_bytes,
+                        char* mc_bytes,
+                        GrowableArray<char*>& symtab);
+
+    static class InstanceKlass* resolve_klass_utf8(const char* name, TRAPS);
+    static class Method* resolve_method_utf8(class InstanceKlass* ik,
+                                             const char* mname,
+                                             const char* msig);
   };
 
   static void load(class JavaThread* THREAD);
   static void dump_to_stream(class fileStream* out);
+  static void eager_compile_after_load(class JavaThread* THREAD);
 };
 
 #endif // SHARE_SERVICES_PROFILECHECKPOINT_HPP

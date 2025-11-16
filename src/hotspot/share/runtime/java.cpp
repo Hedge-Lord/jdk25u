@@ -316,8 +316,6 @@ void print_statistics() {
         VM_MDOReplayDump(fileStream* out) : _out(out) {}
         virtual VMOp_Type type() const { return VMOp_GC_HeapInspection; }
         virtual void doit() {
-          ProfileCheckpoint::Writer* dummy = nullptr; // include dependency anchor
-          (void)dummy;
           ProfileCheckpoint::dump_to_stream(_out);
         }
       } op(&fs);
