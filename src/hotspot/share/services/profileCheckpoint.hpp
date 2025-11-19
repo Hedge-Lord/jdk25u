@@ -12,7 +12,6 @@ public:
    // Binary format v3 (File = [HEADER][SYMTAB][RECORDS])
   // HEADER:
   //   magic[4] = 'M','D','O','X'
-   //   version     : u32 (==3)
    //   pointer_size: u16 (e.g., 8)
    //   endianness  : u16 (0=little, 1=big)
    //   layout flags: see LayoutFlags
@@ -72,11 +71,11 @@ public:
     const char* sig;
     u4          mdo_size;
     const void* mdo_ptr;
+    u1          comp_level;
   };
 
    struct Header {
     char magic[4];
-    u4   version;
      u2   pointer_size;
      u2   endianness;
      LayoutFlags layout;
@@ -92,11 +91,13 @@ public:
      MethodKey key;
      u4        mdo_size;
      u4        fixup_count;
+    u4        header_size;
      u4        mc_size; // bytes of MethodCounters snapshot (may be 0)
+    u1        comp_level;
 
      static bool write(fileStream* out, const Record& r, const void* mdo_bytes,
-                       const Fixup* fixups, const void* mc_bytes);
-     static bool read(FILE* in, Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes);
+                      const Fixup* fixups, const void* mc_bytes, const void* header_bytes);
+    static bool read(FILE* in, Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes, char*& header_bytes);
    };
 
   class BinaryStreamWriter {
@@ -106,7 +107,7 @@ public:
     bool write_header(u4 sym_count, u4 rec_count);
     bool write_symtab(const GrowableArray<const char*>& symbols) const;
     bool write_record(const Record& r, const void* mdo_bytes,
-                      const Fixup* fixups, const void* mc_bytes) const;
+                      const Fixup* fixups, const void* mc_bytes, const void* header_bytes) const;
   };
 
   class BinaryStreamReader {
@@ -115,7 +116,7 @@ public:
     explicit BinaryStreamReader(FILE* in) : _in(in) {}
     bool read_header(Header& h) const;
     bool read_symtab(GrowableArray<char*>& symbols, u4 expected) const;
-    bool read_record(Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes) const;
+    bool read_record(Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes, char*& header_bytes) const;
   };
 
   class SymtabBuilder {
@@ -164,6 +165,7 @@ public:
                         Fixup* fixups,
                         char* mdo_bytes,
                         char* mc_bytes,
+                        char* header_bytes,
                         GrowableArray<char*>& symtab);
 
     static class InstanceKlass* resolve_klass_utf8(const char* name, TRAPS);
@@ -174,7 +176,7 @@ public:
 
   static void load(class JavaThread* THREAD);
   static void dump_to_stream(class fileStream* out);
-  static void eager_compile_after_load(class JavaThread* THREAD);
+  static void wait_for_compile_completion(class JavaThread* THREAD);
 };
 
 #endif // SHARE_SERVICES_PROFILECHECKPOINT_HPP
