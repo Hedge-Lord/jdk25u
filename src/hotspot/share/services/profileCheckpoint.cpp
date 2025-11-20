@@ -2,6 +2,7 @@
 #include "utilities/ostream.hpp"
 #include "classfile/systemDictionary.hpp"
 #include "classfile/symbolTable.hpp"
+#include "classfile/classLoaderDataGraph.hpp"
 #include "services/profileCheckpoint_globals.hpp"
 #include "oops/instanceKlass.hpp"
 #include "oops/methodData.hpp"
@@ -756,7 +757,7 @@ GrowableArray<Method*> get_methods() {
       g_methods->push(m);
     }
   };
-  SystemDictionary::methods_do(collect_with_mdo);
+  ClassLoaderDataGraph::methods_do(collect_with_mdo);
   return methods;
 }
 
