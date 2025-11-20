@@ -92,6 +92,37 @@ static void print_mdo_header(MethodData* mdo, outputStream* st = tty) {
   st->cr();
 }
 
+static ProfileCheckpoint::LoaderId loader_id_from_loader(ClassLoaderData* cld) {
+  if (cld == nullptr || cld->is_boot_class_loader_data()) return ProfileCheckpoint::LoaderId::BOOT;
+  if (cld->is_platform_class_loader_data()) return ProfileCheckpoint::LoaderId::PLATFORM;
+  if (cld->is_system_class_loader_data()) return ProfileCheckpoint::LoaderId::SYSTEM;
+  return ProfileCheckpoint::LoaderId::UNDEFINED;
+}
+
+static Handle loader_handle_from_loader(ProfileCheckpoint::LoaderId loader_id, TRAPS) {
+  switch (loader_id) {
+    case ProfileCheckpoint::LoaderId::BOOT: return Handle();
+    case ProfileCheckpoint::LoaderId::PLATFORM: return Handle(THREAD, SystemDictionary::java_platform_loader());
+    case ProfileCheckpoint::LoaderId::SYSTEM: return Handle(THREAD, SystemDictionary::java_system_loader());
+    default: return Handle();
+  }
+}
+
+static InstanceKlass* resolve_klass_utf8(const char* name, ProfileCheckpoint::LoaderId loader_id, TRAPS) {
+  Symbol* sym = SymbolTable::new_symbol(name);
+  Handle loader = loader_handle_from_loader(loader_id, THREAD);
+  Klass* k = SystemDictionary::resolve_or_fail(sym, loader, true, THREAD);
+  if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; return nullptr; }
+  return (k != nullptr && k->is_instance_klass()) ? InstanceKlass::cast(k) : nullptr;
+}
+
+static Method* resolve_method_utf8(InstanceKlass* ik, const char* mname, const char* msig) {
+  if (ik == nullptr) return nullptr;
+  Symbol* mn = SymbolTable::new_symbol(mname);
+  Symbol* sg = SymbolTable::new_symbol(msig);
+  return ik->find_method(mn, sg);
+}
+
 static void sanitize_type_entries(MethodData* mdo) {
   for (ProfileData* pd = mdo->first_data(); mdo->is_valid(pd); pd = mdo->next_data(pd)) {
     if (pd->is_VirtualCallData() || pd->is_ReceiverTypeData()) {
@@ -159,6 +190,7 @@ static void collect_type_fixups(MethodData* mdo,
           fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
           fx.kind = ProfileCheckpoint::FixupKind::KLASS;
           fx.target.id = stb.intern(cname);
+          fx.loader = loader_id_from_loader(k->class_loader_data());
           out_fixups.append(fx);
         }
       }
@@ -176,6 +208,7 @@ static void collect_type_fixups(MethodData* mdo,
             fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
             fx.kind = ProfileCheckpoint::FixupKind::KLASS;
             fx.target.id = stb.intern(cname);
+            fx.loader = loader_id_from_loader(k->class_loader_data());
             out_fixups.append(fx);
           }
         }
@@ -190,6 +223,7 @@ static void collect_type_fixups(MethodData* mdo,
           fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
           fx.kind = ProfileCheckpoint::FixupKind::KLASS;
           fx.target.id = stb.intern(cname);
+          fx.loader = loader_id_from_loader(k->class_loader_data());
           out_fixups.append(fx);
         }
       }
@@ -207,6 +241,7 @@ static void collect_type_fixups(MethodData* mdo,
             fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
             fx.kind = ProfileCheckpoint::FixupKind::KLASS;
             fx.target.id = stb.intern(cname);
+            fx.loader = loader_id_from_loader(k->class_loader_data());
             out_fixups.append(fx);
           }
         }
@@ -221,6 +256,7 @@ static void collect_type_fixups(MethodData* mdo,
           fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
           fx.kind = ProfileCheckpoint::FixupKind::KLASS;
           fx.target.id = stb.intern(cname);
+          fx.loader = loader_id_from_loader(k->class_loader_data());
           out_fixups.append(fx);
         }
       }
@@ -238,6 +274,7 @@ static void collect_type_fixups(MethodData* mdo,
         fx.offset_in_mdo = (u4)((p_dp + off_b) - (address)mdo);
         fx.kind = ProfileCheckpoint::FixupKind::KLASS;
         fx.target.id = stb.intern(cname);
+        fx.loader = loader_id_from_loader(k->class_loader_data());
         out_fixups.append(fx);
       }
     }
@@ -248,15 +285,7 @@ static void apply_fixups(MethodData* mdo,
                          const ProfileCheckpoint::Fixup* fixups,
                          u4 fixup_count,
                          GrowableArray<char*>& symtab,
-                         ProfileCheckpoint::LoaderId loader,
                          TRAPS) {
-  Handle loader_h;
-  switch (loader) {
-    case ProfileCheckpoint::LoaderId::BOOT:      loader_h = Handle(); break;
-    case ProfileCheckpoint::LoaderId::PLATFORM:  loader_h = Handle(THREAD, SystemDictionary::java_platform_loader()); break;
-    case ProfileCheckpoint::LoaderId::APP:       loader_h = Handle(THREAD, SystemDictionary::java_system_loader()); break;
-    default:                                     loader_h = Handle(); break;
-  }
   for (u4 fi = 0; fi < fixup_count; fi++) {
     const ProfileCheckpoint::Fixup& fx = fixups[fi];
     if (fx.kind != ProfileCheckpoint::FixupKind::KLASS) {
@@ -270,16 +299,14 @@ static void apply_fixups(MethodData* mdo,
       continue;
     }
     const char* cname = symtab.at((int)fx.target.id);
-    Symbol* sym = SymbolTable::new_symbol(cname);
-    Klass* k = SystemDictionary::resolve_or_fail(sym, loader_h, true, THREAD);
-    if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; k = nullptr; }
-    if (k != nullptr && k->is_instance_klass()) {
+    InstanceKlass* k = resolve_klass_utf8(cname, fx.loader, THREAD);
+    if (k != nullptr) {
       address cell_addr = (address)mdo + fx.offset_in_mdo;
       intptr_t* cell = (intptr_t*)cell_addr;
       *cell = TypeEntries::with_status(InstanceKlass::cast(k), *cell);
     } else {
       log_debug(compilation)("MDO checkpoint: fixup unresolved %s (loader=%d) at off=%u",
-                             cname, (int)loader, fx.offset_in_mdo);
+                             cname, (int)fx.loader, fx.offset_in_mdo);
     }
   }
 }
@@ -470,22 +497,6 @@ const char* ProfileCheckpoint::Loader::load_status_name(LoadStatus status) {
   }
 }
 
-InstanceKlass* ProfileCheckpoint::Loader::resolve_klass_utf8(const char* name, TRAPS) {
-  Symbol* sym = SymbolTable::new_symbol(name);
-  oop sys_loader_oop = SystemDictionary::java_system_loader();
-  Handle loader(THREAD, sys_loader_oop);
-  Klass* k = SystemDictionary::resolve_or_fail(sym, loader, true, THREAD);
-  if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; return nullptr; }
-  return (k != nullptr && k->is_instance_klass()) ? InstanceKlass::cast(k) : nullptr;
-}
-
-Method* ProfileCheckpoint::Loader::resolve_method_utf8(InstanceKlass* ik, const char* mname, const char* msig) {
-  if (ik == nullptr) return nullptr;
-  Symbol* mn = SymbolTable::new_symbol(mname);
-  Symbol* sg = SymbolTable::new_symbol(msig);
-  return ik->find_method(mn, sg);
-}
-
 static void trigger_eager_compile(Method* target, u1 stored_level, JavaThread* thread) {
   if (!EagerCompileAfterLoad) return;
   if (target == nullptr || thread == nullptr) return;
@@ -533,7 +544,7 @@ bool ProfileCheckpoint::Loader::install_record(const Record& rec,
   const char* mname = symtab.at((int)rec.key.name.id);
   const char* msig  = symtab.at((int)rec.key.sig.id);
 
-  InstanceKlass* holder = resolve_klass_utf8(kname, THREAD);
+  InstanceKlass* holder = resolve_klass_utf8(kname, rec.key.loader, THREAD);
   if (holder == nullptr) {
     log_debug(compilation)("MDO checkpoint: resolve class failed for %s", kname);
     return false;
@@ -580,7 +591,7 @@ bool ProfileCheckpoint::Loader::install_record(const Record& rec,
 
   sanitize_type_entries(mdo);
   if (fixups != nullptr && rec.fixup_count > 0) {
-    apply_fixups(mdo, fixups, rec.fixup_count, symtab, rec.key.loader, THREAD);
+    apply_fixups(mdo, fixups, rec.fixup_count, symtab, THREAD);
   }
 
   _records_installed++;
@@ -874,15 +885,7 @@ bool ProfileCheckpoint::Loader::dump_to_stream(fileStream* out) {
     MethodData* mdo = m->method_data();
     Record rec;
 
-    // todo: handle custom loaders
-    oop cl = m->method_holder()->class_loader();
-    if (cl == nullptr) {
-      rec.key.loader = LoaderId::BOOT;
-    } else if (SystemDictionary::is_platform_class_loader(cl)) {
-      rec.key.loader = LoaderId::PLATFORM;
-    } else {
-      rec.key.loader = LoaderId::APP;
-    }
+    rec.key.loader = loader_id_from_loader(m->method_holder()->class_loader_data());
     rec.key.klass.id = stb.id_of(rn.kname);
     rec.key.name.id  = stb.id_of(rn.mname);
     rec.key.sig.id   = stb.id_of(rn.sig);

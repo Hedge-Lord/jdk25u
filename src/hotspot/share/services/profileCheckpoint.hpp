@@ -25,7 +25,7 @@ public:
    //   klass_id:u32, name_id:u32, sig_id:u32, loader:u8, mdo_size:u32,
    //   fixup_count:u32, Fixup[fixup_count], [mdo_size bytes]
 
-  enum class LoaderId : u1 { BOOT, PLATFORM, APP, UNDEFINED };
+  enum class LoaderId : u1 { BOOT, PLATFORM, SYSTEM, UNDEFINED };
   enum class FixupKind : u1 { KLASS, METHOD };
 
   struct SymbolId { uint32_t id; };
@@ -34,6 +34,7 @@ public:
     uint32_t offset_in_mdo;
     FixupKind kind;
     SymbolId  target;
+    LoaderId  loader;
   };
 
    struct ByteRange { uint64_t off; uint32_t size; };
@@ -167,11 +168,6 @@ public:
                         char* mc_bytes,
                         char* header_bytes,
                         GrowableArray<char*>& symtab);
-
-    static class InstanceKlass* resolve_klass_utf8(const char* name, TRAPS);
-    static class Method* resolve_method_utf8(class InstanceKlass* ik,
-                                             const char* mname,
-                                             const char* msig);
   };
 
   static void load(class JavaThread* THREAD);
