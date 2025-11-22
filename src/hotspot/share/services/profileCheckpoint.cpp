@@ -3,6 +3,7 @@
 #include "classfile/systemDictionary.hpp"
 #include "classfile/symbolTable.hpp"
 #include "classfile/classLoaderDataGraph.hpp"
+#include "classfile/classLoaderData.hpp"
 #include "services/profileCheckpoint_globals.hpp"
 #include "oops/instanceKlass.hpp"
 #include "oops/methodData.hpp"
@@ -189,7 +190,6 @@ static void collect_type_fixups(MethodData* mdo,
           const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
           ProfileCheckpoint::Fixup fx;
           fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-          fx.kind = ProfileCheckpoint::FixupKind::KLASS;
           fx.target.id = stb.intern(cname);
           fx.loader = loader_id_from_loader(k->class_loader_data());
           out_fixups.append(fx);
@@ -207,7 +207,6 @@ static void collect_type_fixups(MethodData* mdo,
             const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
             ProfileCheckpoint::Fixup fx;
             fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-            fx.kind = ProfileCheckpoint::FixupKind::KLASS;
             fx.target.id = stb.intern(cname);
             fx.loader = loader_id_from_loader(k->class_loader_data());
             out_fixups.append(fx);
@@ -222,7 +221,6 @@ static void collect_type_fixups(MethodData* mdo,
           const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
           ProfileCheckpoint::Fixup fx;
           fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-          fx.kind = ProfileCheckpoint::FixupKind::KLASS;
           fx.target.id = stb.intern(cname);
           fx.loader = loader_id_from_loader(k->class_loader_data());
           out_fixups.append(fx);
@@ -240,7 +238,6 @@ static void collect_type_fixups(MethodData* mdo,
             const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
             ProfileCheckpoint::Fixup fx;
             fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-            fx.kind = ProfileCheckpoint::FixupKind::KLASS;
             fx.target.id = stb.intern(cname);
             fx.loader = loader_id_from_loader(k->class_loader_data());
             out_fixups.append(fx);
@@ -255,7 +252,6 @@ static void collect_type_fixups(MethodData* mdo,
           const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
           ProfileCheckpoint::Fixup fx;
           fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
-          fx.kind = ProfileCheckpoint::FixupKind::KLASS;
           fx.target.id = stb.intern(cname);
           fx.loader = loader_id_from_loader(k->class_loader_data());
           out_fixups.append(fx);
@@ -273,7 +269,6 @@ static void collect_type_fixups(MethodData* mdo,
         const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
         ProfileCheckpoint::Fixup fx;
         fx.offset_in_mdo = (u4)((p_dp + off_b) - (address)mdo);
-        fx.kind = ProfileCheckpoint::FixupKind::KLASS;
         fx.target.id = stb.intern(cname);
         fx.loader = loader_id_from_loader(k->class_loader_data());
         out_fixups.append(fx);
@@ -289,11 +284,6 @@ static void apply_fixups(MethodData* mdo,
                          TRAPS) {
   for (u4 fi = 0; fi < fixup_count; fi++) {
     const ProfileCheckpoint::Fixup& fx = fixups[fi];
-    if (fx.kind != ProfileCheckpoint::FixupKind::KLASS) {
-      log_debug(compilation)("MDO checkpoint: unsupported fixup kind=%d at off=%u sym_id=%u",
-                             (int)fx.kind, fx.offset_in_mdo, fx.target.id);
-      continue;
-    }
     if ((int)fx.target.id < 0 || (int)fx.target.id >= symtab.length()) {
       log_debug(compilation)("MDO checkpoint: invalid sym_id=%u (symtab_len=%d) at off=%u",
                              fx.target.id, symtab.length(), fx.offset_in_mdo);
@@ -326,7 +316,15 @@ static bool write_u4(fileStream* out, u4 v) {
   return write_exact(out, &v, sizeof(v));
 }
 
+static bool write_u1(fileStream* out, u1 v) {
+  return write_exact(out, &v, sizeof(v));
+}
+
 static bool read_u4(FILE* in, u4& v) {
+  return read_exact(in, &v, sizeof(v));
+}
+
+static bool read_u1(FILE* in, u1& v) {
   return read_exact(in, &v, sizeof(v));
 }
 
@@ -350,6 +348,7 @@ bool ProfileCheckpoint::Header::write(fileStream* out, const Header& h) {
   if (!write_exact(out, &h.layout, sizeof(h.layout))) return false;
   if (!write_u4(out, h.sym_count)) return false;
   if (!write_u4(out, h.rec_count)) return false;
+  if (!write_u4(out, h.class_count)) return false;
   return true;
 }
 
@@ -361,6 +360,7 @@ bool ProfileCheckpoint::Header::read(FILE* in, Header& h) {
   if (!read_exact(in, &h.layout, sizeof(h.layout))) return false;
   if (!read_u4(in, h.sym_count)) return false;
   if (!read_u4(in, h.rec_count)) return false;
+  if (!read_u4(in, h.class_count)) return false;
   return true;
 }
          
@@ -369,7 +369,7 @@ static u2 detect_endianness() {
   return (u.b[0] == 1) ? (u2)0 : (u2)1;
 }
 
-void ProfileCheckpoint::Header::init(Header& h, u4 sym_count, u4 rec_count) {
+void ProfileCheckpoint::Header::init(Header& h, u4 sym_count, u4 rec_count, u4 class_count) {
   h.magic[0] = 'M'; h.magic[1] = 'D'; h.magic[2] = 'O'; h.magic[3] = 'X';
   h.pointer_size = (u2)sizeof(void*);
   h.endianness = detect_endianness();
@@ -382,6 +382,7 @@ void ProfileCheckpoint::Header::init(Header& h, u4 sym_count, u4 rec_count) {
   h.layout.spec_trap_limit_extra_entries = (int32_t)SpecTrapLimitExtraEntries;
   h.sym_count = sym_count;
   h.rec_count = rec_count;
+  h.class_count = class_count;
 }
 
 bool ProfileCheckpoint::Record::write(fileStream* out, const Record& r, const void* mdo_bytes, const Fixup* fixups, const void* mc_bytes, const void* header_bytes) {
@@ -395,8 +396,6 @@ bool ProfileCheckpoint::Record::write(fileStream* out, const Record& r, const vo
   if (!write_u4(out, r.fixup_count)) return false;
   for (u4 i = 0; i < r.fixup_count; i++) {
     if (!write_u4(out, fixups[i].offset_in_mdo)) return false;
-    u1 kind = (u1)fixups[i].kind;
-    if (!write_exact(out, &kind, sizeof(kind))) return false;
     if (!write_u4(out, fixups[i].target.id)) return false;
   }
   if (!write_exact(out, mdo_bytes, r.mdo_size)) return false;
@@ -426,10 +425,7 @@ bool ProfileCheckpoint::Record::read(FILE* in, Record& r, Fixup*& fixups, char*&
     fixups = (Fixup*)os::malloc(sizeof(Fixup) * r.fixup_count, mtInternal);
     if (fixups == nullptr) return false;
     for (u4 i = 0; i < r.fixup_count; i++) {
-      u1 kind = 0;
       if (!read_u4(in, fixups[i].offset_in_mdo)) { os::free(fixups); return false; }
-      if (!read_exact(in, &kind, sizeof(kind))) { os::free(fixups); return false; }
-      fixups[i].kind = (FixupKind)kind;
       if (!read_u4(in, fixups[i].target.id)) { os::free(fixups); return false; }
     }
   }
@@ -670,6 +666,29 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
     result.status = LoadStatus::SymtabReadFailed;
     return result;
   }
+  GrowableArray<ProfileCheckpoint::Class> classes((int)hdr.class_count);
+  if (!reader.read_classes(classes, hdr.class_count)) {
+    fclose(f);
+    result.status = LoadStatus::RecordReadFailed;
+    return result;
+  }
+
+  JavaThread* THREAD = _thread; // For exception macros.
+  for (int ci = 0; ci < classes.length(); ci++) {
+    const ProfileCheckpoint::Class& cls = classes.at(ci);
+    if ((int)cls.klass.id >= symtab.length()) {
+      continue;
+    }
+    const char* cname = symtab.at((int)cls.klass.id);
+    InstanceKlass* holder = resolve_klass_utf8(cname, cls.loader, THREAD);
+    if (holder != nullptr) {
+      holder->link_class(THREAD);
+      if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+    } else {
+      log_debug(compilation)("MDO checkpoint: preload class failed for %s (loader=%d)",
+                             cname, (int)cls.loader);
+    }
+  }
 
   result.status = LoadStatus::Success;
 
@@ -748,6 +767,30 @@ static ProfileCheckpoint::RecMeta make_rec_meta_for_method(Method* m) {
 }
 
 // Get all methods with MDO data
+class CollectClassesClosure : public KlassClosure {
+  ProfileCheckpoint::SymtabBuilder* _stb;
+  GrowableArray<ProfileCheckpoint::Class>* _classes;
+public:
+  CollectClassesClosure(ProfileCheckpoint::SymtabBuilder* stb,
+                        GrowableArray<ProfileCheckpoint::Class>* classes)
+    : _stb(stb), _classes(classes) {}
+
+  virtual void do_klass(Klass* k) {
+    if (k == nullptr || !k->is_instance_klass()) return;
+    InstanceKlass* ik = InstanceKlass::cast(k);
+    ProfileCheckpoint::Class c;
+    c.loader = loader_id_from_loader(ik->class_loader_data());
+    c.klass.id = _stb->intern(ik->name()->as_utf8());
+    _classes->append(c);
+  }
+};
+
+static void collect_classes(ProfileCheckpoint::SymtabBuilder& stb,
+                            GrowableArray<ProfileCheckpoint::Class>& classes) {
+  CollectClassesClosure closure(&stb, &classes);
+  ClassLoaderDataGraph::classes_do(&closure);
+}
+
 GrowableArray<Method*> get_methods() {
   GrowableArray<Method*> methods(1024);
   static GrowableArray<Method*>* g_methods;
@@ -779,9 +822,9 @@ u4 ProfileCheckpoint::SymtabBuilder::id_of(const char* s) const {
   return (u4)UINT_MAX;
 }
 
-bool ProfileCheckpoint::BinaryStreamWriter::write_header(u4 sym_count, u4 rec_count) {
+bool ProfileCheckpoint::BinaryStreamWriter::write_header(u4 sym_count, u4 rec_count, u4 class_count) {
   Header h;
-  Header::init(h, sym_count, rec_count);
+  Header::init(h, sym_count, rec_count, class_count);
   return Header::write(_out, h);
 }
 
@@ -791,6 +834,15 @@ bool ProfileCheckpoint::BinaryStreamWriter::write_symtab(const GrowableArray<con
     u4 len = (u4)strlen(s);
     if (!write_u4(_out, len)) return false;
     if (!write_exact(_out, s, len)) return false;
+  }
+  return true;
+}
+
+bool ProfileCheckpoint::BinaryStreamWriter::write_classes(const GrowableArray<Class>& classes) const {
+  for (int i = 0; i < classes.length(); i++) {
+    const Class& c = classes.at(i);
+    if (!write_u1(_out, (u1)c.loader)) return false;
+    if (!write_u4(_out, c.klass.id)) return false;
   }
   return true;
 }
@@ -811,6 +863,24 @@ bool ProfileCheckpoint::BinaryStreamReader::read_symtab(GrowableArray<char*>& sy
       return false;
     }
     symbols.append(s);
+  }
+  return true;
+}
+
+bool ProfileCheckpoint::BinaryStreamReader::read_classes(GrowableArray<Class>& classes, u4 expected) const {
+  for (u4 ci = 0; ci < expected; ci++) {
+    u1 loader_raw = 0;
+    if (!read_u1(_in, loader_raw)) {
+      return false;
+    }
+    u4 klass_id = 0;
+    if (!read_u4(_in, klass_id)) {
+      return false;
+    }
+    Class c;
+    c.loader = (LoaderId)loader_raw;
+    c.klass.id = klass_id;
+    classes.append(c);
   }
   return true;
 }
@@ -845,12 +915,14 @@ bool ProfileCheckpoint::Loader::dump_to_stream(fileStream* out) {
   }
 
   ResourceMark rm;
-  GrowableArray<Method*> methods = get_methods();
   SymtabBuilder stb;
+  GrowableArray<ProfileCheckpoint::Class> classes(1024);
+  collect_classes(stb, classes);
+  GrowableArray<Method*> methods = get_methods();
   GrowableArray<RecMeta> recs(1024);
 
   for (int i = 0; i < methods.length(); i++) {
-    Method* m = methods.at(i);
+    Method* m = methods.at(i);  
     if (m->method_data() == nullptr) continue;
     recs.append(make_rec_meta_for_method(m));
   }
@@ -872,10 +944,13 @@ bool ProfileCheckpoint::Loader::dump_to_stream(fileStream* out) {
   stb.freeze();
 
   BinaryStreamWriter writer(out);
-  if (!writer.write_header(stb.length(), (u4)recs.length())) {
+  if (!writer.write_header(stb.length(), (u4)recs.length(), (u4)classes.length())) {
     return false;
   }
   if (!writer.write_symtab(stb.symbols())) {
+    return false;
+  }
+  if (!writer.write_classes(classes)) {
     return false;
   }
 

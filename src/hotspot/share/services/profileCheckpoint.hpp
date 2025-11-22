@@ -9,45 +9,47 @@ class fileStream;
 
 class ProfileCheckpoint {
 public:
-   // Binary format v3 (File = [HEADER][SYMTAB][RECORDS])
-  // HEADER:
-  //   magic[4] = 'M','D','O','X'
-   //   pointer_size: u16 (e.g., 8)
-   //   endianness  : u16 (0=little, 1=big)
-   //   layout flags: see LayoutFlags
-   //   sym_count   : u32
-   //   rec_count   : u32
-  //
-  // SYMTAB: repeated sym_count times
-  //   [u32 len][len bytes utf8]
-  //
-   // RECORD: repeated rec_count times
-   //   klass_id:u32, name_id:u32, sig_id:u32, loader:u8, mdo_size:u32,
-   //   fixup_count:u32, Fixup[fixup_count], [mdo_size bytes]
+    // Binary format v3 (File = [HEADER][SYMTAB][RECORDS])
+    // HEADER:
+    //   magic[4] = 'M','D','O','X'
+    //   pointer_size: u16 (e.g., 8)
+    //   endianness  : u16 (0=little, 1=big)
+    //   layout flags: see LayoutFlags
+    //   sym_count   : u32
+    //   rec_count   : u32
+    //   class_count : u32
+    //
+    // SYMTAB: repeated sym_count times
+    //   [u32 len][len bytes utf8]
+    //
+    // CLASS: repeated class_count times:
+    //   [u4 loader_id][u4 klass_sym_id]
+    // 
+    // RECORD: repeated rec_count times
+    //   klass_id:u32, name_id:u32, sig_id:u32, loader:u8, mdo_size:u32,
+    //   fixup_count:u32, Fixup[fixup_count], [mdo_size bytes]
 
   enum class LoaderId : u1 { BOOT, PLATFORM, SYSTEM, UNDEFINED };
-  enum class FixupKind : u1 { KLASS, METHOD };
 
   struct SymbolId { uint32_t id; };
 
   struct Fixup {
     uint32_t offset_in_mdo;
-    FixupKind kind;
     SymbolId  target;
     LoaderId  loader;
   };
 
-   struct ByteRange { uint64_t off; uint32_t size; };
+  struct ByteRange { uint64_t off; uint32_t size; };
 
-   struct LayoutFlags {
-     uint32_t type_profile_level;
-     int32_t  type_profile_args_limit;
-     int32_t  type_profile_parms_limit;
-     int64_t  type_profile_width;
-     uint8_t  profile_traps;
-     uint8_t  type_profile_casts;
-     int32_t  spec_trap_limit_extra_entries;
-   };
+  struct LayoutFlags {
+    uint32_t type_profile_level;
+    int32_t  type_profile_args_limit;
+    int32_t  type_profile_parms_limit;
+    int64_t  type_profile_width;
+    uint8_t  profile_traps;
+    uint8_t  type_profile_casts;
+    int32_t  spec_trap_limit_extra_entries;
+  };
 
   struct MethodKey {
     LoaderId  loader;
@@ -75,38 +77,45 @@ public:
     u1          comp_level;
   };
 
-   struct Header {
+  struct Header {
     char magic[4];
-     u2   pointer_size;
-     u2   endianness;
-     LayoutFlags layout;
+    u2   pointer_size;
+    u2   endianness;
+    LayoutFlags layout;
     u4   sym_count;
     u4   rec_count;
+    u4   class_count;
 
-    static void init(Header& h, u4 sym_count, u4 rec_count);
+    static void init(Header& h, u4 sym_count, u4 rec_count, u4 class_count);
     static bool write(fileStream* out, const Header& h);
     static bool read(FILE* in, Header& h);
   };
 
-   struct Record {
-     MethodKey key;
-     u4        mdo_size;
-     u4        fixup_count;
+  struct Class {
+    LoaderId loader;
+    SymbolId klass;
+  };
+
+  struct Record {
+    MethodKey key;
+    u4        mdo_size;
+    u4        fixup_count;
     u4        header_size;
-     u4        mc_size; // bytes of MethodCounters snapshot (may be 0)
+    u4        mc_size; // bytes of MethodCounters snapshot (may be 0)
     u1        comp_level;
 
-     static bool write(fileStream* out, const Record& r, const void* mdo_bytes,
+    static bool write(fileStream* out, const Record& r, const void* mdo_bytes,
                       const Fixup* fixups, const void* mc_bytes, const void* header_bytes);
     static bool read(FILE* in, Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes, char*& header_bytes);
-   };
+  };
 
   class BinaryStreamWriter {
     fileStream* _out;
   public:
     explicit BinaryStreamWriter(fileStream* out) : _out(out) {}
-    bool write_header(u4 sym_count, u4 rec_count);
+    bool write_header(u4 sym_count, u4 rec_count, u4 class_count);
     bool write_symtab(const GrowableArray<const char*>& symbols) const;
+    bool write_classes(const GrowableArray<Class>& classes) const;
     bool write_record(const Record& r, const void* mdo_bytes,
                       const Fixup* fixups, const void* mc_bytes, const void* header_bytes) const;
   };
@@ -117,6 +126,7 @@ public:
     explicit BinaryStreamReader(FILE* in) : _in(in) {}
     bool read_header(Header& h) const;
     bool read_symtab(GrowableArray<char*>& symbols, u4 expected) const;
+    bool read_classes(GrowableArray<Class>& classes, u4 expected) const;
     bool read_record(Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes, char*& header_bytes) const;
   };
 
