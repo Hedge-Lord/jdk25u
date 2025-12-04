@@ -10,6 +10,7 @@
 #include "oops/method.hpp"
 #include "oops/methodCounters.hpp"
 #include "oops/klass.inline.hpp"
+#include "oops/objArrayOop.inline.hpp"
 #include "runtime/handles.inline.hpp"
 #include "logging/log.hpp"
 #include "utilities/copy.hpp"
@@ -20,6 +21,12 @@
 #include "compiler/compileBroker.hpp"
 #include "compiler/compilerDefinitions.hpp"
 #include "memory/resourceArea.hpp"
+#include "interpreter/linkResolver.hpp"
+#include "oops/constantPool.inline.hpp"
+#include "oops/cpCache.inline.hpp"
+#include "oops/resolvedIndyEntry.hpp"
+#include "prims/methodHandles.hpp"
+#include "ci/ciReplay.hpp"
 #include "services/dynoLocatorScan.hpp"
 #include <cstdio>
 #include <cstring>
@@ -130,7 +137,14 @@ static Handle loader_handle_from_loader(ProfileCheckpoint::LoaderId loader_id, T
   }
 }
 
+
+
 static InstanceKlass* resolve_klass_utf8(const char* name, ProfileCheckpoint::LoaderId loader_id, TRAPS) {
+  if (name != nullptr && name[0] == '@') {
+    log_debug(compilation)("resolving %s", name);
+    InstanceKlass* hk = DynoLocatorScan::resolve_locator(name, THREAD);
+    if (hk != nullptr) return hk;
+  }
   Symbol* sym = SymbolTable::new_symbol(name);
   Handle loader = loader_handle_from_loader(loader_id, THREAD);
   Klass* k = SystemDictionary::resolve_or_fail(sym, loader, true, THREAD);

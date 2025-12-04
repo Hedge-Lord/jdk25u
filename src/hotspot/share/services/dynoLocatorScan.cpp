@@ -2,6 +2,7 @@
 
 #include "classfile/javaClasses.hpp"
 #include "classfile/vmClasses.hpp"
+#include "classfile/symbolTable.hpp"
 #include "ci/ciReplay.hpp"
 #include "interpreter/bytecodeStream.hpp"
 #include "memory/resourceArea.hpp"
@@ -21,6 +22,9 @@
 #include "runtime/mutexLocker.hpp"
 #include "runtime/os.hpp"
 #include "runtime/threadSMR.hpp"
+#include "interpreter/linkResolver.hpp"
+#include "ci/ciReplay.hpp"
+#include "oops/objArrayOop.inline.hpp"
 #include "utilities/growableArray.hpp"
 #include "utilities/ostream.hpp"
 #include <cstdarg>
@@ -74,6 +78,170 @@ public:
 GrowableArray<DynoLocatorTable::Entry>* DynoLocatorTable::_entries = nullptr;
 Mutex* DynoLocatorTable::_lock = nullptr;
 
+// --- Hidden locator parser (based on ciReplay) ---
+class HiddenLocatorParser {
+  JavaThread* _jt;
+  char* _buf;
+  char* _p;
+
+  void skip_ws() {
+    while (*_p == ' ' || *_p == '\t') _p++;
+  }
+
+  char* next_token() {
+    skip_ws();
+    if (*_p == '\0') return nullptr;
+    char* tok = _p;
+    while (*_p != ' ' && *_p != '\t' && *_p != '\0' && *_p != ';') _p++;
+    if (*_p != '\0') { *_p = '\0'; _p++; }
+    return tok;
+  }
+
+  int parse_int(bool* ok) {
+    skip_ws();
+    char* endp = nullptr;
+    long v = strtol(_p, &endp, 10);
+    if (endp == _p) { if (ok) *ok = false; return 0; }
+    _p = endp;
+    if (ok) *ok = true;
+    return (int)v;
+  }
+
+  InstanceKlass* parse_bci() {
+    char* klass = next_token();
+    char* mname = next_token();
+    char* msig  = next_token();
+    bool ok = true;
+    int bci = parse_int(&ok);
+    if (!ok || klass == nullptr || mname == nullptr || msig == nullptr) return nullptr;
+    Symbol* ksym = SymbolTable::new_symbol(klass);
+    Symbol* mnsym = SymbolTable::new_symbol(mname);
+    Symbol* mssym = SymbolTable::new_symbol(msig);
+    Handle loader(_jt, SystemDictionary::java_system_loader());
+    InstanceKlass* ik = InstanceKlass::cast(SystemDictionary::resolve_or_fail(ksym, loader, true, _jt));
+    if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+    ik->link_class(_jt);
+    if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+    Method* m = ik->find_method(mnsym, mssym);
+    if (m == nullptr) return nullptr;
+    methodHandle caller(_jt, m);
+    Bytecode_invoke bytecode = Bytecode_invoke_check(caller, bci);
+    if (!Bytecodes::is_defined(bytecode.code()) || !bytecode.is_valid()) return nullptr;
+    int index = bytecode.index();
+    const constantPoolHandle cp(_jt, ik->constants());
+    CallInfo callInfo;
+    Bytecodes::Code bc = bytecode.invoke_code();
+    LinkResolver::resolve_invoke(callInfo, Handle(), cp, index, bc, _jt);
+    if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+    oop appendix = nullptr;
+    Method* adapter_method = nullptr;
+    int pool_index = 0;
+    if (bytecode.is_invokedynamic()) {
+      cp->cache()->set_dynamic_call(callInfo, index);
+      appendix = cp->resolved_reference_from_indy(index);
+      adapter_method = cp->resolved_indy_entry_at(index)->method();
+      pool_index = cp->resolved_indy_entry_at(index)->constant_pool_index();
+    } else if (bytecode.is_invokehandle()) {
+      ResolvedMethodEntry* method_entry = cp->cache()->set_method_handle(index, callInfo);
+      appendix = cp->cache()->appendix_if_resolved(method_entry);
+      adapter_method = method_entry->method();
+      pool_index = method_entry->constant_pool_index();
+    } else {
+      return nullptr;
+    }
+    char* dyno_ref = next_token();
+    if (dyno_ref == nullptr) return nullptr;
+    oop obj = nullptr;
+    if (strcmp(dyno_ref, "<appendix>") == 0) {
+      obj = appendix;
+    } else if (strcmp(dyno_ref, "<adapter>") == 0) {
+      char* term = next_token();
+      if (term != nullptr && strcmp(term, ";") == 0 && adapter_method != nullptr) {
+        return adapter_method->method_holder();
+      }
+      return nullptr;
+    } else if (strcmp(dyno_ref, "<bsm>") == 0) {
+      BootstrapInfo bs(cp, pool_index, index);
+      obj = cp->resolve_possibly_cached_constant_at(bs.bsm_index(), _jt);
+    } else {
+      return nullptr;
+    }
+    char* field = next_token();
+    while (field != nullptr && strcmp(field, ";") != 0) {
+      if (strcmp(field, "<vmtarget>") == 0) {
+        Method* vmtarget = java_lang_invoke_MemberName::vmtarget(obj);
+        return (vmtarget != nullptr) ? vmtarget->method_holder() : nullptr;
+      }
+      obj = ciReplay::obj_field(obj, field);
+      if (obj != nullptr && obj->is_objArray()) {
+        bool idx_ok = true;
+        int index = parse_int(&idx_ok);
+        if (!idx_ok || index >= ((objArrayOop)obj)->length()) return nullptr;
+        obj = ((objArrayOop)obj)->obj_at(index);
+      }
+      field = next_token();
+    }
+    return (obj != nullptr && obj->klass()->is_instance_klass()) ? InstanceKlass::cast(obj->klass()) : nullptr;
+  }
+
+  InstanceKlass* parse_cpi() {
+    char* klass = next_token();
+    bool ok = true;
+    int cpi = parse_int(&ok);
+    if (!ok || klass == nullptr) return nullptr;
+    Symbol* ksym = SymbolTable::new_symbol(klass);
+    Handle loader(_jt, SystemDictionary::java_system_loader());
+    InstanceKlass* ik = InstanceKlass::cast(SystemDictionary::resolve_or_fail(ksym, loader, true, _jt));
+    if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+    ik->link_class(_jt);
+    if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+    const constantPoolHandle cp(_jt, ik->constants());
+    if (cpi >= cp->length() || !cp->tag_at(cpi).is_method_handle()) return nullptr;
+    oop obj = cp->resolve_possibly_cached_constant_at(cpi, _jt);
+    if (obj == nullptr) return nullptr;
+    skip_ws();
+    char* field = next_token();
+    while (field != nullptr && strcmp(field, ";") != 0) {
+      if (strcmp(field, "<vmtarget>") == 0) {
+        Method* vmtarget = java_lang_invoke_MemberName::vmtarget(obj);
+        return (vmtarget != nullptr) ? vmtarget->method_holder() : nullptr;
+      }
+      obj = ciReplay::obj_field(obj, field);
+      if (obj != nullptr && obj->is_objArray()) {
+        bool idx_ok = true;
+        int index = parse_int(&idx_ok);
+        if (!idx_ok || index >= ((objArrayOop)obj)->length()) return nullptr;
+        obj = ((objArrayOop)obj)->obj_at(index);
+      }
+      field = next_token();
+    }
+    return (obj != nullptr && obj->klass()->is_instance_klass()) ? InstanceKlass::cast(obj->klass()) : nullptr;
+  }
+
+public:
+  HiddenLocatorParser(const char* loc, JavaThread* jt) : _jt(jt) {
+    size_t len = strlen(loc);
+    _buf = NEW_RESOURCE_ARRAY(char, len + 1);
+    strncpy(_buf, loc, len + 1);
+    _p = _buf;
+  }
+
+  InstanceKlass* parse() {
+    skip_ws();
+    if (*_p != '@') return nullptr;
+    _p++;
+    char* kind = next_token();
+    if (kind == nullptr) return nullptr;
+    if (strcmp(kind, "bci") == 0) {
+      return parse_bci();
+    }
+    if (strcmp(kind, "cpi") == 0) {
+      return parse_cpi();
+    }
+    return nullptr;
+  }
+};
+
 class RecordLocation {
   char* _start;
   char* _end;
@@ -104,6 +272,12 @@ static void record_hidden(InstanceKlass* ik, const char* loc) {
 }
 
 static void record_call_site_obj(JavaThread* jt, oop obj, char* loc_buf);
+static void record_mh(JavaThread* jt, oop mh, char* loc_buf);
+
+// Read an object field by name.
+static inline oop obj_field(oop obj, const char* name) {
+  return ciReplay::obj_field(obj, name);
+}
 
 static void record_member(JavaThread* jt, oop member, char* loc_buf) {
   assert(java_lang_invoke_MemberName::is_instance(member), "!");
@@ -121,8 +295,54 @@ static void record_member(JavaThread* jt, oop member, char* loc_buf) {
   }
 }
 
+static void record_lambdaform(JavaThread* jt, oop form, char* loc_buf) {
+  assert(java_lang_invoke_LambdaForm::is_instance(form), "!");
+
+  {
+    oop member = java_lang_invoke_LambdaForm::vmentry(form);
+    RecordLocation rl(loc_buf, " vmentry");
+    record_member(jt, member, loc_buf);
+  }
+
+  objArrayOop names = (objArrayOop)obj_field(form, "names");
+  if (names != nullptr) {
+    RecordLocation lp0(loc_buf, " names");
+    int len = names->length();
+    for (int i = 0; i < len; ++i) {
+      oop name = names->obj_at(i);
+      RecordLocation lp1(loc_buf, " %d", i);
+      RecordLocation lp2(loc_buf, " function");
+      oop function = obj_field(name, "function");
+      if (function != nullptr) {
+        oop member = obj_field(function, "member");
+        if (member != nullptr) {
+          RecordLocation lp3(loc_buf, " member");
+          record_member(jt, member, loc_buf);
+        }
+        oop mh = obj_field(function, "resolvedHandle");
+        if (mh != nullptr) {
+          RecordLocation lp3(loc_buf, " resolvedHandle");
+          record_mh(jt, mh, loc_buf); // will recurse
+        }
+        oop invoker = obj_field(function, "invoker");
+        if (invoker != nullptr) {
+          RecordLocation lp3(loc_buf, " invoker");
+          record_mh(jt, invoker, loc_buf);
+        }
+      }
+    }
+  }
+}
+
 static void record_mh(JavaThread* jt, oop mh, char* loc_buf) {
   assert(java_lang_invoke_MethodHandle::is_instance(mh), "!");
+  // MethodHandle.form
+  {
+    oop form = java_lang_invoke_MethodHandle::form(mh);
+    RecordLocation rl(loc_buf, " form");
+    record_lambdaform(jt, form, loc_buf);
+  }
+
   if (java_lang_invoke_DirectMethodHandle::is_instance(mh)) {
     oop member = java_lang_invoke_DirectMethodHandle::member(mh);
     RecordLocation rl(loc_buf, " member");
@@ -135,7 +355,7 @@ static void record_mh(JavaThread* jt, oop mh, char* loc_buf) {
   const int max_arg = 99;
   for (int index = 0; index <= max_arg; ++index) {
     jio_snprintf(arg_name, sizeof(arg_name), " argL%d", index);
-    oop arg = ciReplay::obj_field(mh, arg_name + 1); // reuse helper to read field
+    oop arg = obj_field(mh, arg_name + 1);
     if (arg != nullptr) {
       RecordLocation rl(loc_buf, "%s", arg_name);
       if (arg->klass()->is_instance_klass()) {
@@ -272,9 +492,32 @@ void DynoLocatorScan::scan_all_classes() {
         }
       }
     }
+
+    // Scan constant pool MethodHandle entries (@cpi)
+    {
+      RecordLocation rp(loc_buf, "@cpi %s", ik->name()->as_quoted_ascii());
+      int len = cp->length();
+      for (int i = 0; i < len; ++i) {
+        if (cp->tag_at(i).is_method_handle()) {
+          bool found_it;
+          oop mh = cp->find_cached_constant_at(i, found_it, jt);
+          if (mh != nullptr) {
+            RecordLocation rl(loc_buf, " %d", i);
+            record_mh(jt, mh, loc_buf);
+          }
+        }
+      }
+    }
   }
 }
 
 const char* DynoLocatorScan::lookup(InstanceKlass* ik) {
   return DynoLocatorTable::lookup(ik);
+}
+
+InstanceKlass* DynoLocatorScan::resolve_locator(const char* loc, JavaThread* jt) {
+  if (loc == nullptr || jt == nullptr) return nullptr;
+  ResourceMark rm(jt);
+  HiddenLocatorParser p(loc, jt);
+  return p.parse();
 }
