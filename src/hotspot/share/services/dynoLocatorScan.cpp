@@ -25,9 +25,12 @@
 #include "interpreter/linkResolver.hpp"
 #include "ci/ciReplay.hpp"
 #include "oops/objArrayOop.inline.hpp"
+#include "utilities/debug.hpp"
+#include "utilities/utf8.hpp"
 #include "utilities/growableArray.hpp"
 #include "utilities/ostream.hpp"
 #include <cstdarg>
+#include <cctype>
 #include <cstring>
 
 namespace {
@@ -84,17 +87,94 @@ class HiddenLocatorParser {
   char* _buf;
   char* _p;
 
+  static void unescape_string(char* value) {
+    char* from = value;
+    char* to = value;
+    while (*from != '\0') {
+      if (*from != '\\') {
+        *to++ = *from++;
+      } else {
+        switch (from[1]) {
+          case 'u': {
+            from += 2;
+            jchar v = 0;
+            for (int i = 0; i < 4; i++) {
+              char c = *from++;
+              switch (c) {
+                case '0': case '1': case '2': case '3': case '4':
+                case '5': case '6': case '7': case '8': case '9':
+                  v = (v << 4) + c - '0';
+                  break;
+                case 'a': case 'b': case 'c': case 'd': case 'e': case 'f':
+                  v = (v << 4) + 10 + c - 'a';
+                  break;
+                case 'A': case 'B': case 'C': case 'D': case 'E': case 'F':
+                  v = (v << 4) + 10 + c - 'A';
+                  break;
+                default:
+                  ShouldNotReachHere();
+              }
+            }
+            UNICODE::convert_to_utf8(&v, 1, to);
+            to++;
+            break;
+          }
+          case 't': *to++ = '\t'; from += 2; break;
+          case 'n': *to++ = '\n'; from += 2; break;
+          case 'r': *to++ = '\r'; from += 2; break;
+          case 'f': *to++ = '\f'; from += 2; break;
+          default:
+            ShouldNotReachHere();
+        }
+      }
+    }
+    *from = *to;
+  }
+
   void skip_ws() {
     while (*_p == ' ' || *_p == '\t') _p++;
   }
 
-  char* next_token() {
+  char* parse_token() {
     skip_ws();
     if (*_p == '\0') return nullptr;
-    char* tok = _p;
-    while (*_p != ' ' && *_p != '\t' && *_p != '\0' && *_p != ';') _p++;
-    if (*_p != '\0') { *_p = '\0'; _p++; }
+    if (*_p == ';') {
+      _p++;
+      return (char*)";";
+    }
+    char* tok = nullptr;
+    if (*_p == '"') {
+      _p++;
+      tok = _p;
+      while (*_p != '\0' && *_p != '"') {
+        if (*_p == '\\' && _p[1] != '\0') {
+          _p += 2; // skip escaped char
+        } else {
+          _p++;
+        }
+      }
+      if (*_p == '"') {
+        *_p = '\0';
+        _p++;
+      }
+    } else {
+      tok = _p;
+      while (*_p != ' ' && *_p != '\t' && *_p != '\0' && *_p != ';') _p++;
+      if (*_p != '\0') { *_p = '\0'; _p++; }
+    }
+    if (tok != nullptr && !(tok[0] == ';' && tok[1] == '\0')) {
+      unescape_string(tok);
+    }
     return tok;
+  }
+
+  bool parse_terminator() {
+    skip_ws();
+    if (*_p == ';') {
+      _p++;
+      return true;
+    }
+    return false;
   }
 
   int parse_int(bool* ok) {
@@ -108,9 +188,9 @@ class HiddenLocatorParser {
   }
 
   InstanceKlass* parse_bci() {
-    char* klass = next_token();
-    char* mname = next_token();
-    char* msig  = next_token();
+    char* klass = parse_token();
+    char* mname = parse_token();
+    char* msig  = parse_token();
     bool ok = true;
     int bci = parse_int(&ok);
     if (!ok || klass == nullptr || mname == nullptr || msig == nullptr) return nullptr;
@@ -125,8 +205,12 @@ class HiddenLocatorParser {
     Method* m = ik->find_method(mnsym, mssym);
     if (m == nullptr) return nullptr;
     methodHandle caller(_jt, m);
+    if (m->validate_bci(bci) != bci) {
+      return nullptr;
+    }
     Bytecode_invoke bytecode = Bytecode_invoke_check(caller, bci);
     if (!Bytecodes::is_defined(bytecode.code()) || !bytecode.is_valid()) return nullptr;
+    bytecode.verify();
     int index = bytecode.index();
     const constantPoolHandle cp(_jt, ik->constants());
     CallInfo callInfo;
@@ -149,43 +233,54 @@ class HiddenLocatorParser {
     } else {
       return nullptr;
     }
-    char* dyno_ref = next_token();
+    char* dyno_ref = parse_token();
     if (dyno_ref == nullptr) return nullptr;
     oop obj = nullptr;
     if (strcmp(dyno_ref, "<appendix>") == 0) {
       obj = appendix;
     } else if (strcmp(dyno_ref, "<adapter>") == 0) {
-      char* term = next_token();
-      if (term != nullptr && strcmp(term, ";") == 0 && adapter_method != nullptr) {
-        return adapter_method->method_holder();
-      }
-      return nullptr;
+      if (!parse_terminator()) return nullptr;
+      return (adapter_method != nullptr) ? adapter_method->method_holder() : nullptr;
     } else if (strcmp(dyno_ref, "<bsm>") == 0) {
       BootstrapInfo bs(cp, pool_index, index);
       obj = cp->resolve_possibly_cached_constant_at(bs.bsm_index(), _jt);
     } else {
       return nullptr;
     }
-    char* field = next_token();
+    if (obj == nullptr) {
+      return nullptr;
+    }
+    char* field = parse_token();
     while (field != nullptr && strcmp(field, ";") != 0) {
       if (strcmp(field, "<vmtarget>") == 0) {
         Method* vmtarget = java_lang_invoke_MemberName::vmtarget(obj);
-        return (vmtarget != nullptr) ? vmtarget->method_holder() : nullptr;
+        InstanceKlass* res = (vmtarget != nullptr) ? vmtarget->method_holder() : nullptr;
+        if (!parse_terminator()) return nullptr;
+        return res;
       }
       obj = ciReplay::obj_field(obj, field);
-      if (obj != nullptr && obj->is_objArray()) {
+      if (obj == nullptr) {
+        return nullptr;
+      }
+      if (obj->is_objArray()) {
         bool idx_ok = true;
         int index = parse_int(&idx_ok);
         if (!idx_ok || index >= ((objArrayOop)obj)->length()) return nullptr;
         obj = ((objArrayOop)obj)->obj_at(index);
       }
-      field = next_token();
+      field = parse_token();
     }
-    return (obj != nullptr && obj->klass()->is_instance_klass()) ? InstanceKlass::cast(obj->klass()) : nullptr;
+    if (field == nullptr) {
+      if (!parse_terminator()) return nullptr;
+    }
+    if (obj == nullptr) {
+      return nullptr;
+    }
+    return obj->klass()->is_instance_klass() ? InstanceKlass::cast(obj->klass()) : nullptr;
   }
 
   InstanceKlass* parse_cpi() {
-    char* klass = next_token();
+    char* klass = parse_token();
     bool ok = true;
     int cpi = parse_int(&ok);
     if (!ok || klass == nullptr) return nullptr;
@@ -200,22 +295,33 @@ class HiddenLocatorParser {
     oop obj = cp->resolve_possibly_cached_constant_at(cpi, _jt);
     if (obj == nullptr) return nullptr;
     skip_ws();
-    char* field = next_token();
+    char* field = parse_token();
     while (field != nullptr && strcmp(field, ";") != 0) {
       if (strcmp(field, "<vmtarget>") == 0) {
         Method* vmtarget = java_lang_invoke_MemberName::vmtarget(obj);
-        return (vmtarget != nullptr) ? vmtarget->method_holder() : nullptr;
+        InstanceKlass* res = (vmtarget != nullptr) ? vmtarget->method_holder() : nullptr;
+        if (!parse_terminator()) return nullptr;
+        return res;
       }
       obj = ciReplay::obj_field(obj, field);
-      if (obj != nullptr && obj->is_objArray()) {
+      if (obj == nullptr) {
+        return nullptr;
+      }
+      if (obj->is_objArray()) {
         bool idx_ok = true;
         int index = parse_int(&idx_ok);
         if (!idx_ok || index >= ((objArrayOop)obj)->length()) return nullptr;
         obj = ((objArrayOop)obj)->obj_at(index);
       }
-      field = next_token();
+      field = parse_token();
     }
-    return (obj != nullptr && obj->klass()->is_instance_klass()) ? InstanceKlass::cast(obj->klass()) : nullptr;
+    if (field == nullptr) {
+      if (!parse_terminator()) return nullptr;
+    }
+    if (obj == nullptr) {
+      return nullptr;
+    }
+    return obj->klass()->is_instance_klass() ? InstanceKlass::cast(obj->klass()) : nullptr;
   }
 
 public:
@@ -230,15 +336,18 @@ public:
     skip_ws();
     if (*_p != '@') return nullptr;
     _p++;
-    char* kind = next_token();
+    char* kind = parse_token();
     if (kind == nullptr) return nullptr;
+    InstanceKlass* ik = nullptr;
     if (strcmp(kind, "bci") == 0) {
-      return parse_bci();
+      ik = parse_bci();
+    } else if (strcmp(kind, "cpi") == 0) {
+      ik = parse_cpi();
     }
-    if (strcmp(kind, "cpi") == 0) {
-      return parse_cpi();
+    if (ik != nullptr && !ik->is_hidden()) {
+      return nullptr;
     }
-    return nullptr;
+    return ik;
   }
 };
 
@@ -266,9 +375,30 @@ public:
 };
 
 static void record_hidden(InstanceKlass* ik, const char* loc) {
-  if (ik != nullptr && ik->is_hidden() && loc != nullptr) {
-    DynoLocatorTable::record(ik, loc);
+  if (ik == nullptr || !ik->is_hidden() || loc == nullptr) {
+    return;
   }
+  // Mirror ciEnv::dyno_name: recorded locators must end with a terminator.
+  bool has_term = false;
+  size_t len = strlen(loc);
+  for (size_t i = len; i > 0; i--) {
+    char ch = loc[i - 1];
+    if (!isspace(ch)) {
+      has_term = (ch == ';');
+      break;
+    }
+  }
+  if (has_term) {
+    DynoLocatorTable::record(ik, loc);
+    return;
+  }
+  const size_t needed = len + 3; // " ;" + '\0'
+  if (needed > LOC_BUF_LEN) {
+    return; // avoid overflow; nothing recorded.
+  }
+  char term_buf[LOC_BUF_LEN];
+  jio_snprintf(term_buf, sizeof(term_buf), "%s ;", loc);
+  DynoLocatorTable::record(ik, term_buf);
 }
 
 static void record_call_site_obj(JavaThread* jt, oop obj, char* loc_buf);
@@ -381,7 +511,6 @@ static void record_call_site_obj(JavaThread* jt, oop obj, char* loc_buf) {
       RecordLocation rl(loc_buf, " target");
       InstanceKlass* ik = InstanceKlass::cast(target->klass());
       record_hidden(ik, loc_buf);
-      record_call_site_obj(jt, target, loc_buf);
     }
   }
 }
