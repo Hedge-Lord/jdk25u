@@ -29,7 +29,7 @@ public:
     //   klass_id:u32, name_id:u32, sig_id:u32, loader:u8, mdo_size:u32,
     //   fixup_count:u32, Fixup[fixup_count], [mdo_size bytes]
 
-  enum class LoaderId : u1 { BOOT, PLATFORM, SYSTEM, UNDEFINED };
+  enum class LoaderId : u1 { BOOT, PLATFORM, SYSTEM, UNDEFINED, HIDDEN };
 
   struct SymbolId { uint32_t id; };
 
@@ -183,6 +183,7 @@ public:
   static void load(class JavaThread* THREAD);
   static void dump_to_stream(class fileStream* out);
   static void wait_for_compile_completion(class JavaThread* THREAD);
+  static void scan_hidden_class_locators();
 };
 
 #endif // SHARE_SERVICES_PROFILECHECKPOINT_HPP

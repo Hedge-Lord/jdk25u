@@ -20,6 +20,7 @@
 #include "compiler/compileBroker.hpp"
 #include "compiler/compilerDefinitions.hpp"
 #include "memory/resourceArea.hpp"
+#include "services/dynoLocatorScan.hpp"
 #include <cstdio>
 #include <cstring>
 
@@ -94,11 +95,30 @@ static void print_mdo_header(MethodData* mdo, outputStream* st = tty) {
   st->cr();
 }
 
-static ProfileCheckpoint::LoaderId loader_id_from_loader(ClassLoaderData* cld) {
+static ProfileCheckpoint::LoaderId loader_id_from_klass(InstanceKlass* ik) {
+  if (ik != nullptr && ik->is_hidden()) {
+    return ProfileCheckpoint::LoaderId::HIDDEN;
+  }
+  ClassLoaderData* cld = (ik != nullptr) ? ik->class_loader_data() : nullptr;
   if (cld == nullptr || cld->is_boot_class_loader_data()) return ProfileCheckpoint::LoaderId::BOOT;
   if (cld->is_platform_class_loader_data()) return ProfileCheckpoint::LoaderId::PLATFORM;
   if (cld->is_system_class_loader_data()) return ProfileCheckpoint::LoaderId::SYSTEM;
+  log_debug(compilation)("Non-builtin loader encountered: %s", cld->loader_name_and_id());
   return ProfileCheckpoint::LoaderId::UNDEFINED;
+}
+
+static const char* get_klassname_utf8(InstanceKlass* ik) {
+  if (ik == nullptr) {
+    return "<null>";
+  }
+  if (ik->is_hidden()) {
+    if (const char* loc = DynoLocatorScan::lookup(ik)) {
+      log_debug(compilation)("found locator for hidden ik %s: %s", ik->name()->as_utf8(), loc);
+      return loc;
+    }
+    log_debug(compilation)("hidden ik encountered without locator: %s", ik->name()->as_utf8());
+  }
+  return ik->name()->as_utf8();
 }
 
 static Handle loader_handle_from_loader(ProfileCheckpoint::LoaderId loader_id, TRAPS) {
@@ -187,11 +207,12 @@ static void collect_type_fixups(MethodData* mdo,
         intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
         Klass* k = TypeEntries::valid_klass(*cell);
         if (k != nullptr && k->is_instance_klass()) {
-          const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
+          InstanceKlass* ik = InstanceKlass::cast(k);
+          const char* cname = get_klassname_utf8(ik);
           ProfileCheckpoint::Fixup fx;
           fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
           fx.target.id = stb.intern(cname);
-          fx.loader = loader_id_from_loader(k->class_loader_data());
+          fx.loader = loader_id_from_klass(ik);
           out_fixups.append(fx);
         }
       }
@@ -204,11 +225,12 @@ static void collect_type_fixups(MethodData* mdo,
           intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
           Klass* k = TypeEntries::valid_klass(*cell);
           if (k != nullptr && k->is_instance_klass()) {
-            const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
+            InstanceKlass* ik = InstanceKlass::cast(k);
+            const char* cname = get_klassname_utf8(ik);
             ProfileCheckpoint::Fixup fx;
             fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
             fx.target.id = stb.intern(cname);
-            fx.loader = loader_id_from_loader(k->class_loader_data());
+            fx.loader = loader_id_from_klass(ik);
             out_fixups.append(fx);
           }
         }
@@ -218,11 +240,12 @@ static void collect_type_fixups(MethodData* mdo,
         intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
         Klass* k = TypeEntries::valid_klass(*cell);
         if (k != nullptr && k->is_instance_klass()) {
-          const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
+          InstanceKlass* ik = InstanceKlass::cast(k);
+          const char* cname = get_klassname_utf8(ik);
           ProfileCheckpoint::Fixup fx;
           fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
           fx.target.id = stb.intern(cname);
-          fx.loader = loader_id_from_loader(k->class_loader_data());
+          fx.loader = loader_id_from_klass(ik);
           out_fixups.append(fx);
         }
       }
@@ -235,11 +258,12 @@ static void collect_type_fixups(MethodData* mdo,
           intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
           Klass* k = TypeEntries::valid_klass(*cell);
           if (k != nullptr && k->is_instance_klass()) {
-            const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
+            InstanceKlass* ik = InstanceKlass::cast(k);
+            const char* cname = get_klassname_utf8(ik);
             ProfileCheckpoint::Fixup fx;
             fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
             fx.target.id = stb.intern(cname);
-            fx.loader = loader_id_from_loader(k->class_loader_data());
+            fx.loader = loader_id_from_klass(ik);
             out_fixups.append(fx);
           }
         }
@@ -249,11 +273,12 @@ static void collect_type_fixups(MethodData* mdo,
         intptr_t* cell = (intptr_t*)(pd->dp() + off_b);
         Klass* k = TypeEntries::valid_klass(*cell);
         if (k != nullptr && k->is_instance_klass()) {
-          const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
+          InstanceKlass* ik = InstanceKlass::cast(k);
+          const char* cname = get_klassname_utf8(ik);
           ProfileCheckpoint::Fixup fx;
           fx.offset_in_mdo = (u4)((pd->dp() + off_b) - (address)mdo);
           fx.target.id = stb.intern(cname);
-          fx.loader = loader_id_from_loader(k->class_loader_data());
+          fx.loader = loader_id_from_klass(ik);
           out_fixups.append(fx);
         }
       }
@@ -266,11 +291,12 @@ static void collect_type_fixups(MethodData* mdo,
       intptr_t* cell = (intptr_t*)(p_dp + off_b);
       Klass* k = TypeEntries::valid_klass(*cell);
       if (k != nullptr && k->is_instance_klass()) {
-        const char* cname = InstanceKlass::cast(k)->name()->as_utf8();
+        InstanceKlass* ik = InstanceKlass::cast(k);
+        const char* cname = get_klassname_utf8(ik);
         ProfileCheckpoint::Fixup fx;
         fx.offset_in_mdo = (u4)((p_dp + off_b) - (address)mdo);
         fx.target.id = stb.intern(cname);
-        fx.loader = loader_id_from_loader(k->class_loader_data());
+        fx.loader = loader_id_from_klass(ik);
         out_fixups.append(fx);
       }
     }
@@ -742,7 +768,7 @@ static ProfileCheckpoint::RecMeta make_rec_meta_for_method(Method* m) {
   // Caller guarantees mdo != nullptr
   MutexLocker ml(mdo->extra_data_lock(), Mutex::_no_safepoint_check_flag);
   InstanceKlass* holder = m->method_holder();
-  r.kname = holder->name()->as_utf8();
+  r.kname = get_klassname_utf8(holder);
   r.mname = m->name()->as_utf8();
   r.sig   = m->signature()->as_utf8();
   r.mdo_size = (u4)mdo->size_in_bytes();
@@ -779,8 +805,8 @@ public:
     if (k == nullptr || !k->is_instance_klass()) return;
     InstanceKlass* ik = InstanceKlass::cast(k);
     ProfileCheckpoint::Class c;
-    c.loader = loader_id_from_loader(ik->class_loader_data());
-    c.klass.id = _stb->intern(ik->name()->as_utf8());
+    c.loader = loader_id_from_klass(ik);
+    c.klass.id = _stb->intern(get_klassname_utf8(ik));
     _classes->append(c);
   }
 };
@@ -961,7 +987,7 @@ bool ProfileCheckpoint::Loader::dump_to_stream(fileStream* out) {
     MethodData* mdo = m->method_data();
     Record rec;
 
-    rec.key.loader = loader_id_from_loader(m->method_holder()->class_loader_data());
+    rec.key.loader = loader_id_from_klass(m->method_holder());
     rec.key.klass.id = stb.id_of(rn.kname);
     rec.key.name.id  = stb.id_of(rn.mname);
     rec.key.sig.id   = stb.id_of(rn.sig);
@@ -1024,6 +1050,10 @@ bool ProfileCheckpoint::Loader::dump_to_stream(fileStream* out) {
 }
 
 void ProfileCheckpoint::dump_to_stream(fileStream* out) {
+  // Opportunistically scan resolved indy/invokehandle sites to harvest locators
+  // for hidden classes before dumping.
+  DynoLocatorScan::scan_all_classes();
+
   if (!Loader::dump_to_stream(out)) {
     log_warning(compilation)("MDO checkpoint: dump failed");
   }
