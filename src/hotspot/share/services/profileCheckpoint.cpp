@@ -31,16 +31,234 @@
 #include <cstdio>
 #include <cstring>
 
-// ---- helpers (extracted for readability) ----
 
-static bool copy_mdo_payload(MethodData* dst_mdo, const char* src_bytes, u4 src_size) {
-  if (dst_mdo == nullptr) return false;
-  if ((u4)dst_mdo->size_in_bytes() != src_size) return false;
-  address dst_base = dst_mdo->data_base();
-  const size_t data_sz  = (size_t)dst_mdo->data_size();
-  const size_t data_off = (size_t)(dst_base - (address)dst_mdo);
-  const char* src = src_bytes + data_off;
-  Copy::conjoint_jbytes(src, (char*)dst_base, (jlong)data_sz);
+// ============================================================================
+// Binary format + I/O helpers (MDOX) + debug printing
+// ============================================================================
+static u2 detect_endianness() {
+  union { u4 v; u1 b[4]; } u; u.v = 1;
+  return (u.b[0] == 1) ? (u2)0 : (u2)1;
+}
+
+static bool write_exact(fileStream* out, const void* p, size_t n) {
+  if (n == 0) return true;
+  out->write((const char*)p, n);
+  return true;
+}
+
+static bool read_exact(FILE* in, void* p, size_t n) {
+  return ::fread(p, 1, n, in) == n;
+}
+
+static bool write_u4(fileStream* out, u4 v) {
+  return write_exact(out, &v, sizeof(v));
+}
+
+static bool write_u1(fileStream* out, u1 v) {
+  return write_exact(out, &v, sizeof(v));
+}
+
+static bool read_u4(FILE* in, u4& v) {
+  return read_exact(in, &v, sizeof(v));
+}
+
+static bool read_u1(FILE* in, u1& v) {
+  return read_exact(in, &v, sizeof(v));
+}
+
+static char* read_str(FILE* in) {
+  u4 len = 0;
+  if (!read_u4(in, len)) return nullptr;
+  char* buf = (char*)os::malloc(len + 1, mtInternal);
+  if (buf == nullptr) return nullptr;
+  if (len > 0 && !read_exact(in, buf, len)) { os::free(buf); return nullptr; }
+  buf[len] = '\0';
+  return buf;
+}
+
+static bool write_u2(fileStream* out, u2 v) { return write_exact(out, &v, sizeof(v)); }
+static bool read_u2(FILE* in, u2& v) { return read_exact(in, &v, sizeof(v)); }
+
+static bool write_header(fileStream* out, const ProfileCheckpoint::Header& h) {
+  if (!write_exact(out, h.magic, sizeof(h.magic))) return false;
+  if (!write_u2(out, h.pointer_size)) return false;
+  if (!write_u2(out, h.endianness)) return false;
+  if (!write_exact(out, &h.layout, sizeof(h.layout))) return false;
+  if (!write_u4(out, h.sym_count)) return false;
+  if (!write_u4(out, h.rec_count)) return false;
+  if (!write_u4(out, h.class_count)) return false;
+  return true;
+}
+
+static bool read_header(FILE* in, ProfileCheckpoint::Header& h) {
+  if (!read_exact(in, h.magic, sizeof(h.magic))) return false;
+  if (h.magic[0] != 'M' || h.magic[1] != 'D' || h.magic[2] != 'O' || h.magic[3] != 'X') return false;
+  if (!read_u2(in, h.pointer_size)) return false;
+  if (!read_u2(in, h.endianness)) return false;
+  if (!read_exact(in, &h.layout, sizeof(h.layout))) return false;
+  if (!read_u4(in, h.sym_count)) return false;
+  if (!read_u4(in, h.rec_count)) return false;
+  if (!read_u4(in, h.class_count)) return false;
+  return true;
+}
+
+static void init_header(ProfileCheckpoint::Header& h, u4 sym_count, u4 rec_count, u4 class_count) {
+  h.magic[0] = 'M'; h.magic[1] = 'D'; h.magic[2] = 'O'; h.magic[3] = 'X';
+  h.pointer_size = (u2)sizeof(void*);
+  h.endianness = detect_endianness();
+  h.layout.type_profile_level = (uint32_t)TypeProfileLevel;
+  h.layout.type_profile_args_limit = (int32_t)TypeProfileArgsLimit;
+  h.layout.type_profile_parms_limit = (int32_t)TypeProfileParmsLimit;
+  h.layout.type_profile_width = (int64_t)TypeProfileWidth;
+  h.layout.profile_traps = (uint8_t)(ProfileTraps ? 1 : 0);
+  h.layout.type_profile_casts = (uint8_t)(TypeProfileCasts ? 1 : 0);
+  h.layout.spec_trap_limit_extra_entries = (int32_t)SpecTrapLimitExtraEntries;
+  h.sym_count = sym_count;
+  h.rec_count = rec_count;
+  h.class_count = class_count;
+}
+
+static bool write_symtab(fileStream* out, const GrowableArray<const char*>& symbols) {
+  for (int i = 0; i < symbols.length(); i++) {
+    const char* s = symbols.at(i);
+    u4 len = (u4)strlen(s);
+    if (!write_u4(out, len)) return false;
+    if (!write_exact(out, s, len)) return false;
+  }
+  return true;
+}
+
+static bool read_symtab(FILE* in, GrowableArray<char*>& symbols, u4 expected) {
+  for (u4 si = 0; si < expected; si++) {
+    char* s = read_str(in);
+    if (s == nullptr) {
+      return false;
+    }
+    symbols.append(s);
+  }
+  return true;
+}
+
+static bool write_classes(fileStream* out, const GrowableArray<ProfileCheckpoint::Class>& classes) {
+  for (int i = 0; i < classes.length(); i++) {
+    const ProfileCheckpoint::Class& c = classes.at(i);
+    if (!write_u1(out, (u1)c.loader)) return false;
+    if (!write_u4(out, c.klass.id)) return false;
+  }
+  return true;
+}
+
+static bool read_classes(FILE* in, GrowableArray<ProfileCheckpoint::Class>& classes, u4 expected) {
+  for (u4 ci = 0; ci < expected; ci++) {
+    u1 loader_raw = 0;
+    if (!read_u1(in, loader_raw)) {
+      return false;
+    }
+    u4 klass_id = 0;
+    if (!read_u4(in, klass_id)) {
+      return false;
+    }
+    ProfileCheckpoint::Class c;
+    c.loader = (ProfileCheckpoint::LoaderId)loader_raw;
+    c.klass.id = klass_id;
+    classes.append(c);
+  }
+  return true;
+}
+
+static bool write_record(fileStream* out, const ProfileCheckpoint::Record& r, const void* mdo_bytes, const ProfileCheckpoint::Fixup* fixups, const void* mc_bytes, const void* header_bytes) {
+  if (!write_u4(out, r.key.klass.id)) return false;
+  if (!write_u4(out, r.key.name.id))  return false;
+  if (!write_u4(out, r.key.sig.id))   return false;
+  u1 loader = (u1)r.key.loader;
+  if (!write_exact(out, &loader, sizeof(loader))) return false;
+  if (!write_exact(out, &r.comp_level, sizeof(r.comp_level))) return false;
+  if (!write_u4(out, r.mdo_size)) return false;
+  if (!write_u4(out, r.fixup_count)) return false;
+  for (u4 i = 0; i < r.fixup_count; i++) {
+    if (!write_u4(out, fixups[i].offset_in_mdo)) return false;
+    if (!write_u4(out, fixups[i].target.id)) return false;
+    u1 fx_loader = (u1)fixups[i].loader;
+    if (!write_u1(out, fx_loader)) return false;
+  }
+  if (!write_exact(out, mdo_bytes, r.mdo_size)) return false;
+  if (!write_u4(out, r.header_size)) return false;
+  if (r.header_size > 0) {
+    if (!write_exact(out, header_bytes, r.header_size)) return false;
+  }
+  if (!write_u4(out, r.mc_size)) return false;
+  if (r.mc_size > 0) {
+    if (!write_exact(out, mc_bytes, r.mc_size)) return false;
+  }
+  return true;
+}
+
+static bool read_record(FILE* in, ProfileCheckpoint::Record& r, ProfileCheckpoint::Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes, char*& header_bytes) {
+  if (!read_u4(in, r.key.klass.id)) return false;
+  if (!read_u4(in, r.key.name.id))  return false;
+  if (!read_u4(in, r.key.sig.id))   return false;
+  u1 loader = 0;
+  if (!read_exact(in, &loader, sizeof(loader))) return false;
+  r.key.loader = (ProfileCheckpoint::LoaderId)loader;
+  if (!read_exact(in, &r.comp_level, sizeof(r.comp_level))) return false;
+  if (!read_u4(in, r.mdo_size)) return false;
+  if (!read_u4(in, r.fixup_count)) return false;
+  fixups = nullptr;
+  if (r.fixup_count > 0) {
+    fixups = (ProfileCheckpoint::Fixup*)os::malloc(sizeof(ProfileCheckpoint::Fixup) * r.fixup_count, mtInternal);
+    if (fixups == nullptr) return false;
+    for (u4 i = 0; i < r.fixup_count; i++) {
+      if (!read_u4(in, fixups[i].offset_in_mdo)) { os::free(fixups); return false; }
+      if (!read_u4(in, fixups[i].target.id)) { os::free(fixups); return false; }
+      u1 fx_loader = 0;
+      if (!read_u1(in, fx_loader)) { os::free(fixups); return false; }
+      fixups[i].loader = (ProfileCheckpoint::LoaderId)fx_loader;
+    }
+  }
+  mdo_bytes = nullptr;
+  if (r.mdo_size > 0) {
+    mdo_bytes = (char*)os::malloc(r.mdo_size, mtInternal);
+    if (mdo_bytes == nullptr) { if (fixups) os::free(fixups); return false; }
+    if (!read_exact(in, mdo_bytes, r.mdo_size)) { os::free(mdo_bytes); if (fixups) os::free(fixups); return false; }
+  }
+  header_bytes = nullptr;
+  if (!read_u4(in, r.header_size)) {
+    if (fixups) os::free(fixups);
+    if (mdo_bytes) os::free(mdo_bytes);
+    return false;
+  }
+  if (r.header_size > 0) {
+    header_bytes = (char*)os::malloc(r.header_size, mtInternal);
+    if (header_bytes == nullptr) {
+      if (fixups) os::free(fixups);
+      if (mdo_bytes) os::free(mdo_bytes);
+      return false;
+    }
+    if (!read_exact(in, header_bytes, r.header_size)) {
+      os::free(header_bytes);
+      if (fixups) os::free(fixups);
+      if (mdo_bytes) os::free(mdo_bytes);
+      return false;
+    }
+  }
+  if (!read_u4(in, r.mc_size)) return false;
+  mc_bytes = nullptr;
+  if (r.mc_size > 0) {
+    mc_bytes = (char*)os::malloc(r.mc_size, mtInternal);
+    if (mc_bytes == nullptr) {
+      if (fixups) os::free(fixups);
+      if (mdo_bytes) os::free(mdo_bytes);
+      if (header_bytes) os::free(header_bytes);
+      return false;
+    }
+    if (!read_exact(in, mc_bytes, r.mc_size)) {
+      os::free(mc_bytes);
+      if (fixups) os::free(fixups);
+      if (mdo_bytes) os::free(mdo_bytes);
+      if (header_bytes) os::free(header_bytes);
+      return false;
+    }
+  }
   return true;
 }
 
@@ -102,6 +320,9 @@ static void print_mdo_header(MethodData* mdo, outputStream* st = tty) {
   st->cr();
 }
 
+// ============================================================================
+// Symbolic resolution helpers (LoaderId / klass / method)
+// ============================================================================
 static ProfileCheckpoint::LoaderId loader_id_from_klass(InstanceKlass* ik) {
   if (ik != nullptr && ik->is_hidden()) {
     return ProfileCheckpoint::LoaderId::HIDDEN;
@@ -112,6 +333,15 @@ static ProfileCheckpoint::LoaderId loader_id_from_klass(InstanceKlass* ik) {
   if (cld->is_system_class_loader_data()) return ProfileCheckpoint::LoaderId::SYSTEM;
   log_debug(compilation)("Non-builtin loader encountered: %s", cld->loader_name_and_id());
   return ProfileCheckpoint::LoaderId::UNDEFINED;
+}
+
+static Handle loader_handle_from_loader(ProfileCheckpoint::LoaderId loader_id, TRAPS) {
+  switch (loader_id) {
+    case ProfileCheckpoint::LoaderId::BOOT: return Handle();
+    case ProfileCheckpoint::LoaderId::PLATFORM: return Handle(THREAD, SystemDictionary::java_platform_loader());
+    case ProfileCheckpoint::LoaderId::SYSTEM: return Handle(THREAD, SystemDictionary::java_system_loader());
+    default: return Handle();
+  }
 }
 
 static const char* get_klassname_utf8(InstanceKlass* ik) {
@@ -127,17 +357,6 @@ static const char* get_klassname_utf8(InstanceKlass* ik) {
   }
   return ik->name()->as_utf8();
 }
-
-static Handle loader_handle_from_loader(ProfileCheckpoint::LoaderId loader_id, TRAPS) {
-  switch (loader_id) {
-    case ProfileCheckpoint::LoaderId::BOOT: return Handle();
-    case ProfileCheckpoint::LoaderId::PLATFORM: return Handle(THREAD, SystemDictionary::java_platform_loader());
-    case ProfileCheckpoint::LoaderId::SYSTEM: return Handle(THREAD, SystemDictionary::java_system_loader());
-    default: return Handle();
-  }
-}
-
-
 
 static InstanceKlass* resolve_klass_utf8(const char* name, ProfileCheckpoint::LoaderId loader_id, TRAPS) {
   if (name != nullptr && name[0] == '@') {
@@ -159,6 +378,9 @@ static Method* resolve_method_utf8(InstanceKlass* ik, const char* mname, const c
   return ik->find_method(mn, sg);
 }
 
+// ============================================================================
+// Type-profile fixups (collect/sanitize/apply)
+// ============================================================================
 static void sanitize_type_entries(MethodData* mdo) {
   for (ProfileData* pd = mdo->first_data(); mdo->is_valid(pd); pd = mdo->next_data(pd)) {
     if (pd->is_VirtualCallData() || pd->is_ReceiverTypeData()) {
@@ -342,196 +564,18 @@ static void apply_fixups(MethodData* mdo,
   }
 }
 
-static bool write_exact(fileStream* out, const void* p, size_t n) {
-  if (n == 0) return true;
-  out->write((const char*)p, n);
+// ============================================================================
+// Load/install path (validate header, install records into live MDOs)
+// ============================================================================
+static bool copy_mdo_payload(MethodData* dst_mdo, const char* src_bytes, u4 src_size) {
+  if (dst_mdo == nullptr) return false;
+  if ((u4)dst_mdo->size_in_bytes() != src_size) return false;
+  address dst_base = dst_mdo->data_base();
+  const size_t data_sz  = (size_t)dst_mdo->data_size();
+  const size_t data_off = (size_t)(dst_base - (address)dst_mdo);
+  const char* src = src_bytes + data_off;
+  Copy::conjoint_jbytes(src, (char*)dst_base, (jlong)data_sz);
   return true;
-}
-
-static bool read_exact(FILE* in, void* p, size_t n) {
-  return ::fread(p, 1, n, in) == n;
-}
-
-static bool write_u4(fileStream* out, u4 v) {
-  return write_exact(out, &v, sizeof(v));
-}
-
-static bool write_u1(fileStream* out, u1 v) {
-  return write_exact(out, &v, sizeof(v));
-}
-
-static bool read_u4(FILE* in, u4& v) {
-  return read_exact(in, &v, sizeof(v));
-}
-
-static bool read_u1(FILE* in, u1& v) {
-  return read_exact(in, &v, sizeof(v));
-}
-
-static char* read_str(FILE* in) {
-  u4 len = 0;
-  if (!read_u4(in, len)) return nullptr;
-  char* buf = (char*)os::malloc(len + 1, mtInternal);
-  if (buf == nullptr) return nullptr;
-  if (len > 0 && !read_exact(in, buf, len)) { os::free(buf); return nullptr; }
-  buf[len] = '\0';
-  return buf;
-}
-
-static bool write_u2(fileStream* out, u2 v) { return write_exact(out, &v, sizeof(v)); }
-static bool read_u2(FILE* in, u2& v) { return read_exact(in, &v, sizeof(v)); }
-
-bool ProfileCheckpoint::Header::write(fileStream* out, const Header& h) {
-  if (!write_exact(out, h.magic, sizeof(h.magic))) return false;
-  if (!write_u2(out, h.pointer_size)) return false;
-  if (!write_u2(out, h.endianness)) return false;
-  if (!write_exact(out, &h.layout, sizeof(h.layout))) return false;
-  if (!write_u4(out, h.sym_count)) return false;
-  if (!write_u4(out, h.rec_count)) return false;
-  if (!write_u4(out, h.class_count)) return false;
-  return true;
-}
-
-bool ProfileCheckpoint::Header::read(FILE* in, Header& h) {
-  if (!read_exact(in, h.magic, sizeof(h.magic))) return false;
-  if (h.magic[0] != 'M' || h.magic[1] != 'D' || h.magic[2] != 'O' || h.magic[3] != 'X') return false;
-  if (!read_u2(in, h.pointer_size)) return false;
-  if (!read_u2(in, h.endianness)) return false;
-  if (!read_exact(in, &h.layout, sizeof(h.layout))) return false;
-  if (!read_u4(in, h.sym_count)) return false;
-  if (!read_u4(in, h.rec_count)) return false;
-  if (!read_u4(in, h.class_count)) return false;
-  return true;
-}
-         
-static u2 detect_endianness() {
-  union { u4 v; u1 b[4]; } u; u.v = 1;
-  return (u.b[0] == 1) ? (u2)0 : (u2)1;
-}
-
-void ProfileCheckpoint::Header::init(Header& h, u4 sym_count, u4 rec_count, u4 class_count) {
-  h.magic[0] = 'M'; h.magic[1] = 'D'; h.magic[2] = 'O'; h.magic[3] = 'X';
-  h.pointer_size = (u2)sizeof(void*);
-  h.endianness = detect_endianness();
-  h.layout.type_profile_level = (uint32_t)TypeProfileLevel;
-  h.layout.type_profile_args_limit = (int32_t)TypeProfileArgsLimit;
-  h.layout.type_profile_parms_limit = (int32_t)TypeProfileParmsLimit;
-  h.layout.type_profile_width = (int64_t)TypeProfileWidth;
-  h.layout.profile_traps = (uint8_t)(ProfileTraps ? 1 : 0);
-  h.layout.type_profile_casts = (uint8_t)(TypeProfileCasts ? 1 : 0);
-  h.layout.spec_trap_limit_extra_entries = (int32_t)SpecTrapLimitExtraEntries;
-  h.sym_count = sym_count;
-  h.rec_count = rec_count;
-  h.class_count = class_count;
-}
-
-bool ProfileCheckpoint::Record::write(fileStream* out, const Record& r, const void* mdo_bytes, const Fixup* fixups, const void* mc_bytes, const void* header_bytes) {
-  if (!write_u4(out, r.key.klass.id)) return false;
-  if (!write_u4(out, r.key.name.id))  return false;
-  if (!write_u4(out, r.key.sig.id))   return false;
-  u1 loader = (u1)r.key.loader;
-  if (!write_exact(out, &loader, sizeof(loader))) return false;
-  if (!write_exact(out, &r.comp_level, sizeof(r.comp_level))) return false;
-  if (!write_u4(out, r.mdo_size)) return false;
-  if (!write_u4(out, r.fixup_count)) return false;
-  for (u4 i = 0; i < r.fixup_count; i++) {
-    if (!write_u4(out, fixups[i].offset_in_mdo)) return false;
-    if (!write_u4(out, fixups[i].target.id)) return false;
-  }
-  if (!write_exact(out, mdo_bytes, r.mdo_size)) return false;
-  if (!write_u4(out, r.header_size)) return false;
-  if (r.header_size > 0) {
-    if (!write_exact(out, header_bytes, r.header_size)) return false;
-  }
-  if (!write_u4(out, r.mc_size)) return false;
-  if (r.mc_size > 0) {
-    if (!write_exact(out, mc_bytes, r.mc_size)) return false;
-  }
-  return true;
-}
-
-bool ProfileCheckpoint::Record::read(FILE* in, Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes, char*& header_bytes) {
-  if (!read_u4(in, r.key.klass.id)) return false;
-  if (!read_u4(in, r.key.name.id))  return false;
-  if (!read_u4(in, r.key.sig.id))   return false;
-  u1 loader = 0;
-  if (!read_exact(in, &loader, sizeof(loader))) return false;
-  r.key.loader = (LoaderId)loader;
-  if (!read_exact(in, &r.comp_level, sizeof(r.comp_level))) return false;
-  if (!read_u4(in, r.mdo_size)) return false;
-  if (!read_u4(in, r.fixup_count)) return false;
-  fixups = nullptr;
-  if (r.fixup_count > 0) {
-    fixups = (Fixup*)os::malloc(sizeof(Fixup) * r.fixup_count, mtInternal);
-    if (fixups == nullptr) return false;
-    for (u4 i = 0; i < r.fixup_count; i++) {
-      if (!read_u4(in, fixups[i].offset_in_mdo)) { os::free(fixups); return false; }
-      if (!read_u4(in, fixups[i].target.id)) { os::free(fixups); return false; }
-    }
-  }
-  mdo_bytes = nullptr;
-  if (r.mdo_size > 0) {
-    mdo_bytes = (char*)os::malloc(r.mdo_size, mtInternal);
-    if (mdo_bytes == nullptr) { if (fixups) os::free(fixups); return false; }
-    if (!read_exact(in, mdo_bytes, r.mdo_size)) { os::free(mdo_bytes); if (fixups) os::free(fixups); return false; }
-  }
-  header_bytes = nullptr;
-  if (!read_u4(in, r.header_size)) {
-    if (fixups) os::free(fixups);
-    if (mdo_bytes) os::free(mdo_bytes);
-    return false;
-  }
-  if (r.header_size > 0) {
-    header_bytes = (char*)os::malloc(r.header_size, mtInternal);
-    if (header_bytes == nullptr) {
-      if (fixups) os::free(fixups);
-      if (mdo_bytes) os::free(mdo_bytes);
-      return false;
-    }
-    if (!read_exact(in, header_bytes, r.header_size)) {
-      os::free(header_bytes);
-      if (fixups) os::free(fixups);
-      if (mdo_bytes) os::free(mdo_bytes);
-      return false;
-    }
-  }
-  if (!read_u4(in, r.mc_size)) return false;
-  mc_bytes = nullptr;
-  if (r.mc_size > 0) {
-    mc_bytes = (char*)os::malloc(r.mc_size, mtInternal);
-    if (mc_bytes == nullptr) {
-      if (fixups) os::free(fixups);
-      if (mdo_bytes) os::free(mdo_bytes);
-      if (header_bytes) os::free(header_bytes);
-      return false;
-    }
-    if (!read_exact(in, mc_bytes, r.mc_size)) {
-      os::free(mc_bytes);
-      if (fixups) os::free(fixups);
-      if (mdo_bytes) os::free(mdo_bytes);
-      if (header_bytes) os::free(header_bytes);
-      return false;
-    }
-  }
-  return true;
-}
-
-ProfileCheckpoint::Loader::Loader(JavaThread* thread)
-  : _thread(thread),
-    _records_read(0),
-    _records_installed(0),
-    _size_mismatch(0) {}
-
-const char* ProfileCheckpoint::Loader::load_status_name(LoadStatus status) {
-  switch (status) {
-    case LoadStatus::Success:          return "success";
-    case LoadStatus::MissingPath:      return "missing_path";
-    case LoadStatus::FileOpenFailed:   return "file_open_failed";
-    case LoadStatus::HeaderInvalid:    return "header_invalid";
-    case LoadStatus::SymtabReadFailed: return "symtab_read_failed";
-    case LoadStatus::RecordReadFailed: return "record_read_failed";
-    default:                           return "unknown";
-  }
 }
 
 static void trigger_eager_compile(Method* target, u1 stored_level, JavaThread* thread) {
@@ -552,6 +596,70 @@ static void trigger_eager_compile(Method* target, u1 stored_level, JavaThread* t
   if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
 }
 
+static bool header_matches_current_vm(const ProfileCheckpoint::Header& hdr) {
+  bool ok = true;
+
+  const u2 expected_ptr_size = (u2)sizeof(void*);
+  const u2 expected_endian = detect_endianness();
+  if (hdr.pointer_size != expected_ptr_size) {
+    log_warning(compilation)("MDO checkpoint: header mismatch: pointer_size file=%u vm=%u",
+                             (unsigned)hdr.pointer_size, (unsigned)expected_ptr_size);
+    ok = false;
+  }
+  if (hdr.endianness != expected_endian) {
+    log_warning(compilation)("MDO checkpoint: header mismatch: endianness file=%u vm=%u",
+                             (unsigned)hdr.endianness, (unsigned)expected_endian);
+    ok = false;
+  }
+
+  const auto& lf = hdr.layout;
+  const uint32_t exp_tpl = (uint32_t)TypeProfileLevel;
+  const int32_t  exp_args = (int32_t)TypeProfileArgsLimit;
+  const int32_t  exp_parms = (int32_t)TypeProfileParmsLimit;
+  const int64_t  exp_width = (int64_t)TypeProfileWidth;
+  const uint8_t  exp_traps = (uint8_t)(ProfileTraps ? 1 : 0);
+  const uint8_t  exp_casts = (uint8_t)(TypeProfileCasts ? 1 : 0);
+  const int32_t  exp_spec_extra = (int32_t)SpecTrapLimitExtraEntries;
+
+  if (lf.type_profile_level != exp_tpl) {
+    log_warning(compilation)("MDO checkpoint: header mismatch: TypeProfileLevel file=%u vm=%u",
+                             (unsigned)lf.type_profile_level, (unsigned)exp_tpl);
+    ok = false;
+  }
+  if (lf.type_profile_args_limit != exp_args) {
+    log_warning(compilation)("MDO checkpoint: header mismatch: TypeProfileArgsLimit file=%d vm=%d",
+                             (int)lf.type_profile_args_limit, (int)exp_args);
+    ok = false;
+  }
+  if (lf.type_profile_parms_limit != exp_parms) {
+    log_warning(compilation)("MDO checkpoint: header mismatch: TypeProfileParmsLimit file=%d vm=%d",
+                             (int)lf.type_profile_parms_limit, (int)exp_parms);
+    ok = false;
+  }
+  if (lf.type_profile_width != exp_width) {
+    log_warning(compilation)("MDO checkpoint: header mismatch: TypeProfileWidth file=" INT64_FORMAT " vm=" INT64_FORMAT,
+                             (int64_t)lf.type_profile_width, (int64_t)exp_width);
+    ok = false;
+  }
+  if (lf.profile_traps != exp_traps) {
+    log_warning(compilation)("MDO checkpoint: header mismatch: ProfileTraps file=%u vm=%u",
+                             (unsigned)lf.profile_traps, (unsigned)exp_traps);
+    ok = false;
+  }
+  if (lf.type_profile_casts != exp_casts) {
+    log_warning(compilation)("MDO checkpoint: header mismatch: TypeProfileCasts file=%u vm=%u",
+                             (unsigned)lf.type_profile_casts, (unsigned)exp_casts);
+    ok = false;
+  }
+  if (lf.spec_trap_limit_extra_entries != exp_spec_extra) {
+    log_warning(compilation)("MDO checkpoint: header mismatch: SpecTrapLimitExtraEntries file=%d vm=%d",
+                             (int)lf.spec_trap_limit_extra_entries, (int)exp_spec_extra);
+    ok = false;
+  }
+
+  return ok;
+}
+
 void ProfileCheckpoint::wait_for_compile_completion(JavaThread* THREAD) {
   if (!UseCompiler || !CompilationPolicy::is_compilation_enabled()) {
     return;
@@ -568,6 +676,25 @@ void ProfileCheckpoint::wait_for_compile_completion(JavaThread* THREAD) {
     os::naked_short_sleep(1);
   }
   log_info(compilation)("Eager compilation completed");
+}
+
+ProfileCheckpoint::Loader::Loader(JavaThread* thread)
+  : _thread(thread),
+    _records_read(0),
+    _records_installed(0),
+    _size_mismatch(0) {}
+
+const char* ProfileCheckpoint::Loader::load_status_name(LoadStatus status) {
+  switch (status) {
+    case LoadStatus::Success:          return "success";
+    case LoadStatus::MissingPath:      return "missing_path";
+    case LoadStatus::FileOpenFailed:   return "file_open_failed";
+    case LoadStatus::HeaderInvalid:    return "header_invalid";
+    case LoadStatus::HeaderMismatch:   return "header_mismatch";
+    case LoadStatus::SymtabReadFailed: return "symtab_read_failed";
+    case LoadStatus::RecordReadFailed: return "record_read_failed";
+    default:                           return "unknown";
+  }
 }
 
 bool ProfileCheckpoint::Loader::install_record(const Record& rec,
@@ -690,24 +817,27 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   }
 
   ResourceMark rm;
-  BinaryStreamReader reader(f);
-
   Header hdr;
-  if (!reader.read_header(hdr)) {
+  if (!read_header(f, hdr)) {
     fclose(f);
     result.status = LoadStatus::HeaderInvalid;
+    return result;
+  }
+  if (!header_matches_current_vm(hdr)) {
+    fclose(f);
+    result.status = LoadStatus::HeaderMismatch;
     return result;
   }
   u4 sym_count = hdr.sym_count;
   u4 rec_total = hdr.rec_count;
   GrowableArray<char*> symtab((int)sym_count);
-  if (!reader.read_symtab(symtab, sym_count)) {
+  if (!read_symtab(f, symtab, sym_count)) {
     fclose(f);
     result.status = LoadStatus::SymtabReadFailed;
     return result;
   }
   GrowableArray<ProfileCheckpoint::Class> classes((int)hdr.class_count);
-  if (!reader.read_classes(classes, hdr.class_count)) {
+  if (!read_classes(f, classes, hdr.class_count)) {
     fclose(f);
     result.status = LoadStatus::RecordReadFailed;
     return result;
@@ -738,7 +868,7 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
     char* mdo_bytes = nullptr;
     char* mc_bytes = nullptr;
     char* header_bytes = nullptr;
-    if (!reader.read_record(rec, fixups, mdo_bytes, mc_bytes, header_bytes)) {
+    if (!read_record(f, rec, fixups, mdo_bytes, mc_bytes, header_bytes)) {
       log_debug(compilation)("MDO checkpoint: record read failed at %u", i);
       result.status = LoadStatus::RecordReadFailed;
       if (fixups) os::free(fixups);
@@ -775,6 +905,9 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   return result;
 }
 
+// ============================================================================
+// Dump enumeration helpers (collect classes/methods, build symtab)
+// ============================================================================
 // Build RecMeta (holder/name/sig/mdo size/pointer) for a method with an MDO
 static ProfileCheckpoint::RecMeta make_rec_meta_for_method(Method* m) {
   ProfileCheckpoint::RecMeta r{};
@@ -862,75 +995,9 @@ u4 ProfileCheckpoint::SymtabBuilder::id_of(const char* s) const {
   return (u4)UINT_MAX;
 }
 
-bool ProfileCheckpoint::BinaryStreamWriter::write_header(u4 sym_count, u4 rec_count, u4 class_count) {
-  Header h;
-  Header::init(h, sym_count, rec_count, class_count);
-  return Header::write(_out, h);
-}
-
-bool ProfileCheckpoint::BinaryStreamWriter::write_symtab(const GrowableArray<const char*>& symbols) const {
-  for (int i = 0; i < symbols.length(); i++) {
-    const char* s = symbols.at(i);
-    u4 len = (u4)strlen(s);
-    if (!write_u4(_out, len)) return false;
-    if (!write_exact(_out, s, len)) return false;
-  }
-  return true;
-}
-
-bool ProfileCheckpoint::BinaryStreamWriter::write_classes(const GrowableArray<Class>& classes) const {
-  for (int i = 0; i < classes.length(); i++) {
-    const Class& c = classes.at(i);
-    if (!write_u1(_out, (u1)c.loader)) return false;
-    if (!write_u4(_out, c.klass.id)) return false;
-  }
-  return true;
-}
-
-bool ProfileCheckpoint::BinaryStreamWriter::write_record(const Record& r, const void* mdo_bytes,
-                                                         const Fixup* fixups, const void* mc_bytes, const void* header_bytes) const {
-  return Record::write(_out, r, mdo_bytes, fixups, mc_bytes, header_bytes);
-}
-
-bool ProfileCheckpoint::BinaryStreamReader::read_header(Header& h) const {
-  return Header::read(_in, h);
-}
-
-bool ProfileCheckpoint::BinaryStreamReader::read_symtab(GrowableArray<char*>& symbols, u4 expected) const {
-  for (u4 si = 0; si < expected; si++) {
-    char* s = read_str(_in);
-    if (s == nullptr) {
-      return false;
-    }
-    symbols.append(s);
-  }
-  return true;
-}
-
-bool ProfileCheckpoint::BinaryStreamReader::read_classes(GrowableArray<Class>& classes, u4 expected) const {
-  for (u4 ci = 0; ci < expected; ci++) {
-    u1 loader_raw = 0;
-    if (!read_u1(_in, loader_raw)) {
-      return false;
-    }
-    u4 klass_id = 0;
-    if (!read_u4(_in, klass_id)) {
-      return false;
-    }
-    Class c;
-    c.loader = (LoaderId)loader_raw;
-    c.klass.id = klass_id;
-    classes.append(c);
-  }
-  return true;
-}
-
-bool ProfileCheckpoint::BinaryStreamReader::read_record(Record& r, Fixup*& fixups,
-                                                        char*& mdo_bytes, char*& mc_bytes,
-                                                        char*& header_bytes) const {
-  return Record::read(_in, r, fixups, mdo_bytes, mc_bytes, header_bytes);
-}
-
+// ============================================================================
+// Public entrypoints (ProfileCheckpoint::load / dump_to_stream)
+// ============================================================================
 void ProfileCheckpoint::load(JavaThread* THREAD) {
   if (!LoadMDOAtStartup || MDOReplayLoadFile == nullptr) return;
   Loader loader(THREAD);
@@ -949,126 +1016,124 @@ void ProfileCheckpoint::load(JavaThread* THREAD) {
   }
 }
 
-bool ProfileCheckpoint::Loader::dump_to_stream(fileStream* out) {
-  if (out == nullptr) {
-    return false;
-  }
-
-  ResourceMark rm;
-  SymtabBuilder stb;
-  GrowableArray<ProfileCheckpoint::Class> classes(1024);
-  collect_classes(stb, classes);
-  GrowableArray<Method*> methods = get_methods();
-  GrowableArray<RecMeta> recs(1024);
-
-  for (int i = 0; i < methods.length(); i++) {
-    Method* m = methods.at(i);  
-    if (m->method_data() == nullptr) continue;
-    recs.append(make_rec_meta_for_method(m));
-  }
-
-  GrowableArray< GrowableArray<Fixup>* > fixups_per_rec(recs.length());
-  for (int ri = 0; ri < recs.length(); ri++) {
-    Method* m = methods.at(ri);
-    MethodData* mdo = m->method_data();
-    GrowableArray<Fixup>* fx = new GrowableArray<Fixup>(16);
-    collect_type_fixups(mdo, stb, *fx);
-    fixups_per_rec.append(fx);
-  }
-
-  for (int ri = 0; ri < recs.length(); ri++) {
-    stb.intern(recs.at(ri).kname);
-    stb.intern(recs.at(ri).mname);
-    stb.intern(recs.at(ri).sig);
-  }
-  stb.freeze();
-
-  BinaryStreamWriter writer(out);
-  if (!writer.write_header(stb.length(), (u4)recs.length(), (u4)classes.length())) {
-    return false;
-  }
-  if (!writer.write_symtab(stb.symbols())) {
-    return false;
-  }
-  if (!writer.write_classes(classes)) {
-    return false;
-  }
-
-  u4 emitted = 0;
-  for (int ri = 0; ri < recs.length(); ri++) {
-    const RecMeta& rn = recs.at(ri);
-    Method* m = methods.at(ri);
-    MethodData* mdo = m->method_data();
-    Record rec;
-
-    rec.key.loader = loader_id_from_klass(m->method_holder());
-    rec.key.klass.id = stb.id_of(rn.kname);
-    rec.key.name.id  = stb.id_of(rn.mname);
-    rec.key.sig.id   = stb.id_of(rn.sig);
-    rec.key.bytecode_crc32 = 0;
-    rec.mdo_size = rn.mdo_size;
-    rec.comp_level = rn.comp_level;
-    GrowableArray<Fixup>* fx_entries = fixups_per_rec.at(ri);
-    rec.fixup_count = (u4)fx_entries->length();
-
-    const void* mc_bytes = nullptr;
-    MethodData::HeaderSnapshot header_snapshot;
-    mdo->snapshot_header(&header_snapshot);
-    rec.header_size = sizeof(header_snapshot);
-    const void* header_bytes = &header_snapshot;
-    GrowableArray<char> mc_buf(0);
-    MethodCounters* mc = m->method_counters();
-    if (mc != nullptr) {
-      const size_t ic_sz = sizeof(InvocationCounter);
-      const size_t mc_sz = ic_sz * 2 + sizeof(jlong) + sizeof(float) + sizeof(jint);
-      for (size_t fill = 0; fill < mc_sz; fill++) mc_buf.append((char)0);
-      char* p = mc_buf.adr_at(0);
-      Copy::conjoint_jbytes((char*)mc->invocation_counter(), p, (jlong)ic_sz);
-      p += ic_sz;
-      Copy::conjoint_jbytes((char*)mc->backedge_counter(), p, (jlong)ic_sz);
-      p += ic_sz;
-      *(jlong*)p = mc->prev_time(); p += sizeof(jlong);
-      *(float*)p = mc->rate(); p += sizeof(float);
-      *(jint*)p = mc->prev_event_count(); p += sizeof(jint);
-      rec.mc_size = (u4)mc_sz;
-      mc_bytes = mc_buf.adr_at(0);
-    } else {
-      rec.mc_size = 0;
-    }
-    Fixup* fixup_buf = rec.fixup_count ? fx_entries->adr_at(0) : nullptr;
-    if (!writer.write_record(rec, rn.mdo_ptr, fixup_buf, mc_bytes, header_bytes)) {
-      return false;
-    }
-    if (PrintMDOAtDump) {
-      const char* kname = rn.kname;
-      const char* mname = rn.mname;
-      const char* sig   = rn.sig;
-      u1 comp_level = rn.comp_level;
-      tty->print_cr("[Dump] %s %s %s %u", kname, mname, sig, comp_level);
-      tty->print_cr("[MethodDataHeader]");
-      print_mdo_header(mdo);
-      tty->print_cr("[MethodData]");
-      mdo->print_data_on(tty);
-      tty->print_cr("[MethodCounters]");
-      MethodCounters* mc_print = m->method_counters();
-      if (mc_print != nullptr) {
-        mc_print->print_data_on(tty);
-      } else {
-        tty->print_cr("  (none)");
-      }
-    }
-    emitted++;
-  }
-  log_info(compilation)("MDO checkpoint: dumped %u MDOs (sym=%u)", emitted, stb.length());
-  return true;
-}
-
 void ProfileCheckpoint::dump_to_stream(fileStream* out) {
   // Opportunistically scan resolved indy/invokehandle sites to harvest locators
   // for hidden classes before dumping.
   DynoLocatorScan::scan_all_classes();
 
-  if (!Loader::dump_to_stream(out)) {
-    log_warning(compilation)("MDO checkpoint: dump failed");
+  if (out == nullptr) {
+    log_warning(compilation)("MDO checkpoint: dump failed (null output stream)");
+    return;
   }
+
+  bool ok = true;
+  u4 emitted = 0;
+
+  do {
+    ResourceMark rm;
+    SymtabBuilder stb;
+    GrowableArray<ProfileCheckpoint::Class> classes(1024);
+    collect_classes(stb, classes);
+    GrowableArray<Method*> methods = get_methods();
+    GrowableArray<RecMeta> rec_metas(1024);
+
+    for (int i = 0; i < methods.length(); i++) {
+      Method* m = methods.at(i);
+      if (m->method_data() == nullptr) continue;
+      rec_metas.append(make_rec_meta_for_method(m));
+    }
+
+    GrowableArray< GrowableArray<Fixup>* > fixups_per_rec(rec_metas.length());
+    for (int ri = 0; ri < rec_metas.length(); ri++) {
+      Method* m = methods.at(ri);
+      MethodData* mdo = m->method_data();
+      GrowableArray<Fixup>* fx = new GrowableArray<Fixup>(16);
+      collect_type_fixups(mdo, stb, *fx);
+      fixups_per_rec.append(fx);
+    }
+
+    for (int ri = 0; ri < rec_metas.length(); ri++) {
+      stb.intern(rec_metas.at(ri).kname);
+      stb.intern(rec_metas.at(ri).mname);
+      stb.intern(rec_metas.at(ri).sig);
+    }
+    stb.freeze();
+
+    Header h;
+    init_header(h, stb.length(), (u4)rec_metas.length(), (u4)classes.length());
+    if (!write_header(out, h)) { ok = false; break; }
+    if (!write_symtab(out, stb.symbols())) { ok = false; break; }
+    if (!write_classes(out, classes)) { ok = false; break; }
+
+    for (int ri = 0; ri < rec_metas.length(); ri++) {
+      const RecMeta& rec_meta = rec_metas.at(ri);
+      Method* m = methods.at(ri);
+      MethodData* mdo = m->method_data();
+      Record rec;
+
+      rec.key.loader = loader_id_from_klass(m->method_holder());
+      rec.key.klass.id = stb.id_of(rec_meta.kname);
+      rec.key.name.id  = stb.id_of(rec_meta.mname);
+      rec.key.sig.id   = stb.id_of(rec_meta.sig);
+      rec.key.bytecode_crc32 = 0;
+      rec.mdo_size = rec_meta.mdo_size;
+      rec.comp_level = rec_meta.comp_level;
+      GrowableArray<Fixup>* fx_entries = fixups_per_rec.at(ri);
+      rec.fixup_count = (u4)fx_entries->length();
+
+      const void* mc_bytes = nullptr;
+      MethodData::HeaderSnapshot header_snapshot;
+      mdo->snapshot_header(&header_snapshot);
+      rec.header_size = sizeof(header_snapshot);
+      const void* header_bytes = &header_snapshot;
+      GrowableArray<char> mc_buf(0);
+      MethodCounters* mc = m->method_counters();
+      if (mc != nullptr) {
+        const size_t ic_sz = sizeof(InvocationCounter);
+        const size_t mc_sz = ic_sz * 2 + sizeof(jlong) + sizeof(float) + sizeof(jint);
+        for (size_t fill = 0; fill < mc_sz; fill++) mc_buf.append((char)0);
+        char* p = mc_buf.adr_at(0);
+        Copy::conjoint_jbytes((char*)mc->invocation_counter(), p, (jlong)ic_sz);
+        p += ic_sz;
+        Copy::conjoint_jbytes((char*)mc->backedge_counter(), p, (jlong)ic_sz);
+        p += ic_sz;
+        *(jlong*)p = mc->prev_time(); p += sizeof(jlong);
+        *(float*)p = mc->rate(); p += sizeof(float);
+        *(jint*)p = mc->prev_event_count(); p += sizeof(jint);
+        rec.mc_size = (u4)mc_sz;
+        mc_bytes = mc_buf.adr_at(0);
+      } else {
+        rec.mc_size = 0;
+      }
+      Fixup* fixup_buf = rec.fixup_count ? fx_entries->adr_at(0) : nullptr;
+      if (!write_record(out, rec, rec_meta.mdo_ptr, fixup_buf, mc_bytes, header_bytes)) { ok = false; break; }
+
+      if (PrintMDOAtDump) {
+        const char* kname = rec_meta.kname;
+        const char* mname = rec_meta.mname;
+        const char* sig   = rec_meta.sig;
+        u1 comp_level = rec_meta.comp_level;
+        tty->print_cr("[Dump] %s %s %s %u", kname, mname, sig, comp_level);
+        tty->print_cr("[MethodDataHeader]");
+        print_mdo_header(mdo);
+        tty->print_cr("[MethodData]");
+        mdo->print_data_on(tty);
+        tty->print_cr("[MethodCounters]");
+        MethodCounters* mc_print = m->method_counters();
+        if (mc_print != nullptr) {
+          mc_print->print_data_on(tty);
+        } else {
+          tty->print_cr("  (none)");
+        }
+      }
+      emitted++;
+    }
+  } while (false);
+
+  if (!ok) {
+    log_warning(compilation)("MDO checkpoint: dump failed");
+    return;
+  }
+
+  log_info(compilation)("MDO checkpoint: dumped %u MDOs", emitted);
 }

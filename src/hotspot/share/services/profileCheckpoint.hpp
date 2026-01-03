@@ -9,7 +9,7 @@ class fileStream;
 
 class ProfileCheckpoint {
 public:
-    // Binary format v3 (File = [HEADER][SYMTAB][RECORDS])
+    // Binary format (File = [HEADER][SYMTAB][CLASSES][RECORDS])
     // HEADER:
     //   magic[4] = 'M','D','O','X'
     //   pointer_size: u16 (e.g., 8)
@@ -22,12 +22,15 @@ public:
     // SYMTAB: repeated sym_count times
     //   [u32 len][len bytes utf8]
     //
-    // CLASS: repeated class_count times:
-    //   [u4 loader_id][u4 klass_sym_id]
+    // CLASSES: repeated class_count times:
+    //   [u1 loader_id][u4 klass_sym_id]
     // 
     // RECORD: repeated rec_count times
-    //   klass_id:u32, name_id:u32, sig_id:u32, loader:u8, mdo_size:u32,
-    //   fixup_count:u32, Fixup[fixup_count], [mdo_size bytes]
+    //   klass_id:u32, name_id:u32, sig_id:u32, loader:u8, comp_level:u8, mdo_size:u32,
+    //   fixup_count:u32, Fixup[fixup_count], [mdo_size bytes], header_size:u32, [header bytes], mc_size:u32, [mc bytes]
+    //
+    // Fixup: repeated fixup_count times
+    //   [u4 offset_in_mdo][u4 target_sym_id][u1 loader_id]
 
   enum class LoaderId : u1 { BOOT, PLATFORM, SYSTEM, UNDEFINED, HIDDEN };
 
@@ -85,10 +88,6 @@ public:
     u4   sym_count;
     u4   rec_count;
     u4   class_count;
-
-    static void init(Header& h, u4 sym_count, u4 rec_count, u4 class_count);
-    static bool write(fileStream* out, const Header& h);
-    static bool read(FILE* in, Header& h);
   };
 
   struct Class {
@@ -103,31 +102,6 @@ public:
     u4        header_size;
     u4        mc_size; // bytes of MethodCounters snapshot (may be 0)
     u1        comp_level;
-
-    static bool write(fileStream* out, const Record& r, const void* mdo_bytes,
-                      const Fixup* fixups, const void* mc_bytes, const void* header_bytes);
-    static bool read(FILE* in, Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes, char*& header_bytes);
-  };
-
-  class BinaryStreamWriter {
-    fileStream* _out;
-  public:
-    explicit BinaryStreamWriter(fileStream* out) : _out(out) {}
-    bool write_header(u4 sym_count, u4 rec_count, u4 class_count);
-    bool write_symtab(const GrowableArray<const char*>& symbols) const;
-    bool write_classes(const GrowableArray<Class>& classes) const;
-    bool write_record(const Record& r, const void* mdo_bytes,
-                      const Fixup* fixups, const void* mc_bytes, const void* header_bytes) const;
-  };
-
-  class BinaryStreamReader {
-    FILE* _in;
-  public:
-    explicit BinaryStreamReader(FILE* in) : _in(in) {}
-    bool read_header(Header& h) const;
-    bool read_symtab(GrowableArray<char*>& symbols, u4 expected) const;
-    bool read_classes(GrowableArray<Class>& classes, u4 expected) const;
-    bool read_record(Record& r, Fixup*& fixups, char*& mdo_bytes, char*& mc_bytes, char*& header_bytes) const;
   };
 
   class SymtabBuilder {
@@ -150,6 +124,7 @@ public:
       MissingPath,
       FileOpenFailed,
       HeaderInvalid,
+      HeaderMismatch,
       SymtabReadFailed,
       RecordReadFailed
     };
@@ -165,7 +140,6 @@ public:
     explicit Loader(class JavaThread* thread);
     LoadResult load_from_file(const char* path);
     static const char* load_status_name(LoadStatus status);
-    static bool dump_to_stream(fileStream* out);
   private:
     class JavaThread* _thread;
     int _records_read;
