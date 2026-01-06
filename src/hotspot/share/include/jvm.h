@@ -1091,6 +1091,15 @@ JVM_InitAgentProperties(JNIEnv *env, jobject agent_props);
 JNIEXPORT jstring JNICALL
 JVM_GetTemporaryDirectory(JNIEnv *env);
 
+/*
+ * HotSpot profile checkpoint support.
+ */
+JNIEXPORT void JNICALL
+JVM_ProfileCheckpointDump(JNIEnv *env, jstring path);
+
+JNIEXPORT void JNICALL
+JVM_ProfileCheckpointLoad(JNIEnv *env, jstring path);
+
 /* Generics reflection support.
  *
  * Returns information about the given class's EnclosingMethod

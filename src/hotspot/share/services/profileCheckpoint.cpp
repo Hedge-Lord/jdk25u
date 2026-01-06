@@ -836,6 +836,17 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
     result.status = LoadStatus::SymtabReadFailed;
     return result;
   }
+  struct SymtabCleanup {
+    GrowableArray<char*>& _syms;
+    explicit SymtabCleanup(GrowableArray<char*>& syms) : _syms(syms) {}
+    ~SymtabCleanup() {
+      for (int i = 0; i < _syms.length(); i++) {
+        if (_syms.at(i) != nullptr) {
+          os::free(_syms.at(i));
+        }
+      }
+    }
+  } symtab_cleanup(symtab);
   GrowableArray<ProfileCheckpoint::Class> classes((int)hdr.class_count);
   if (!read_classes(f, classes, hdr.class_count)) {
     fclose(f);
@@ -844,6 +855,8 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   }
 
   JavaThread* THREAD = _thread; // For exception macros.
+
+  // preload all classes
   for (int ci = 0; ci < classes.length(); ci++) {
     const ProfileCheckpoint::Class& cls = classes.at(ci);
     if ((int)cls.klass.id >= symtab.length()) {
@@ -861,13 +874,15 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   }
 
   result.status = LoadStatus::Success;
-
+  
+  // process each record
   for (u4 i = 0; i < rec_total; i++) {
     Record rec;
     Fixup* fixups = nullptr;
     char* mdo_bytes = nullptr;
     char* mc_bytes = nullptr;
     char* header_bytes = nullptr;
+
     if (!read_record(f, rec, fixups, mdo_bytes, mc_bytes, header_bytes)) {
       log_debug(compilation)("MDO checkpoint: record read failed at %u", i);
       result.status = LoadStatus::RecordReadFailed;
@@ -912,7 +927,7 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
 static ProfileCheckpoint::RecMeta make_rec_meta_for_method(Method* m) {
   ProfileCheckpoint::RecMeta r{};
   MethodData* mdo = m->method_data();
-  // Caller guarantees mdo != nullptr
+  // caller guarantees mdo != nullptr
   MutexLocker ml(mdo->extra_data_lock(), Mutex::_no_safepoint_check_flag);
   InstanceKlass* holder = m->method_holder();
   r.kname = get_klassname_utf8(holder);
@@ -964,7 +979,7 @@ static void collect_classes(ProfileCheckpoint::SymtabBuilder& stb,
   ClassLoaderDataGraph::classes_do(&closure);
 }
 
-GrowableArray<Method*> get_methods() {
+GrowableArray<Method*> get_methods_with_mdo() {
   GrowableArray<Method*> methods(1024);
   static GrowableArray<Method*>* g_methods;
   g_methods = &methods;
@@ -1034,24 +1049,30 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
     SymtabBuilder stb;
     GrowableArray<ProfileCheckpoint::Class> classes(1024);
     collect_classes(stb, classes);
-    GrowableArray<Method*> methods = get_methods();
+    GrowableArray<Method*> methods_with_mdo = get_methods_with_mdo();
     GrowableArray<RecMeta> rec_metas(1024);
 
-    for (int i = 0; i < methods.length(); i++) {
-      Method* m = methods.at(i);
-      if (m->method_data() == nullptr) continue;
+    // create rec_metas for methods with MDO
+    for (int i = 0; i < methods_with_mdo.length(); i++) {
+      Method* m = methods_with_mdo.at(i);
+      if (m->method_data() == nullptr) {
+        log_warning(compilation)("MDO checkpoint: method %s %s %s has no MDO", m->name()->as_utf8(), m->signature()->as_utf8(), m->method_holder()->name()->as_utf8());
+        ok = false; break;
+      }
       rec_metas.append(make_rec_meta_for_method(m));
     }
 
+    // create fixups for each rec_meta
     GrowableArray< GrowableArray<Fixup>* > fixups_per_rec(rec_metas.length());
     for (int ri = 0; ri < rec_metas.length(); ri++) {
-      Method* m = methods.at(ri);
+      Method* m = methods_with_mdo.at(ri);
       MethodData* mdo = m->method_data();
       GrowableArray<Fixup>* fx = new GrowableArray<Fixup>(16);
       collect_type_fixups(mdo, stb, *fx);
       fixups_per_rec.append(fx);
     }
-
+    
+    // store all symbols in symtab
     for (int ri = 0; ri < rec_metas.length(); ri++) {
       stb.intern(rec_metas.at(ri).kname);
       stb.intern(rec_metas.at(ri).mname);
@@ -1059,15 +1080,17 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
     }
     stb.freeze();
 
+    // write header, symtab, classes
     Header h;
     init_header(h, stb.length(), (u4)rec_metas.length(), (u4)classes.length());
     if (!write_header(out, h)) { ok = false; break; }
     if (!write_symtab(out, stb.symbols())) { ok = false; break; }
     if (!write_classes(out, classes)) { ok = false; break; }
 
+    // write each record
     for (int ri = 0; ri < rec_metas.length(); ri++) {
       const RecMeta& rec_meta = rec_metas.at(ri);
-      Method* m = methods.at(ri);
+      Method* m = methods_with_mdo.at(ri);
       MethodData* mdo = m->method_data();
       Record rec;
 
@@ -1080,7 +1103,8 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
       rec.comp_level = rec_meta.comp_level;
       GrowableArray<Fixup>* fx_entries = fixups_per_rec.at(ri);
       rec.fixup_count = (u4)fx_entries->length();
-
+      
+      // create mc_bytes and header_bytes
       const void* mc_bytes = nullptr;
       MethodData::HeaderSnapshot header_snapshot;
       mdo->snapshot_header(&header_snapshot);
